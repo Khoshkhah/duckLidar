@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "ducklidar"
+version = "0.1.0"
+description = "Query airborne LiDAR instead of loading it — LAS/LAZ/COPC to Parquet, windows, and honest rasters"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+keywords = ["lidar", "las", "laz", "copc", "point-cloud", "parquet", "dtm", "dsm"]
+dependencies = [
+    "numpy>=1.24",
+    "laspy[lazrs]>=2.5",
+    "pyarrow>=14",
+]
+
+[project.optional-dependencies]
+# distance_to_evidence / void_report — how far an interpolated DTM value is from evidence
+grid = ["scipy>=1.10"]
+# ground_filter() — cloth simulation, the only way to get a DTM without the survey's labels
+ground = ["cloth-simulation-filter>=1.1"]
+# boundary() stage 2 — watershed lines that close the contours
+boundary = ["scikit-image>=0.22"]
+# compare_channels() — the interactive viewer
+viz = ["matplotlib>=3.7", "pillow>=10"]
+# scene reconstruction — footprint tracing/triangulation and the rotated-rectangle gable
+scene = ["scipy>=1.10", "shapely>=2.0", "mapbox_earcut>=1.0", "scikit-image>=0.22"]
+dev = ["pytest>=7", "scipy>=1.10", "cloth-simulation-filter>=1.1", "matplotlib>=3.7", "pillow>=10", "scikit-image>=0.22", "shapely>=2.0", "mapbox_earcut>=1.0", "ipykernel>=6"]
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+# compare_channels() reads the viewer shell at runtime
+[tool.setuptools.package-data]
+ducklidar = ["_viewer.html"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

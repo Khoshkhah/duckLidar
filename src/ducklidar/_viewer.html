@@ -1,0 +1,415 @@
+<meta charset="utf-8">
+<title>Instances by multiplying views — LiDAR channel viewer</title>
+<style>
+  :root {
+    --ground: #eef1f4; --panel: #ffffff; --ink: #141a21; --mute: #67747f;
+    --hair: #d3dae0; --viewport: #0d1117;
+    --line-ch: #26708f; --angle-ch: #b3672f; --look-ch: #4c6b3c; --accent: var(--line-ch);
+    --mono: ui-monospace, "SF Mono", "Cascadia Mono", Menlo, Consolas, monospace;
+    --serif: "Iowan Old Style", "Palatino Linotype", Palatino, Georgia, serif;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --ground: #0e1319; --panel: #151c24; --ink: #e4eaef; --mute: #8896a3;
+      --hair: #26313c; --viewport: #06090c;
+      --line-ch: #63b6d8; --angle-ch: #e0975c; --look-ch: #93bd7a;
+    }
+  }
+  :root[data-theme="dark"] {
+    --ground: #0e1319; --panel: #151c24; --ink: #e4eaef; --mute: #8896a3;
+    --hair: #26313c; --viewport: #06090c;
+    --line-ch: #63b6d8; --angle-ch: #e0975c; --look-ch: #93bd7a;
+  }
+  :root[data-theme="light"] {
+    --ground: #eef1f4; --panel: #ffffff; --ink: #141a21; --mute: #67747f;
+    --hair: #d3dae0; --viewport: #0d1117;
+    --line-ch: #26708f; --angle-ch: #b3672f; --look-ch: #4c6b3c;
+  }
+
+  body {
+    margin: 0; background: var(--ground); color: var(--ink);
+    font-family: var(--serif); font-size: 16px; line-height: 1.55;
+  }
+  .wrap { max-width: 1180px; margin: 0 auto; padding: 32px 24px 56px; }
+
+  header { display: flex; flex-direction: column; gap: 10px; margin-bottom: 26px; }
+  .eyebrow {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .16em;
+    text-transform: uppercase; color: var(--mute);
+  }
+  h1 {
+    margin: 0; font-size: clamp(25px, 3.2vw, 37px); font-weight: 600;
+    letter-spacing: -.015em; text-wrap: balance; line-height: 1.14;
+  }
+  .lede { margin: 0; max-width: 66ch; color: var(--mute); }
+  .lede b { color: var(--ink); font-weight: 600; }
+
+  .bench { display: grid; grid-template-columns: 232px minmax(0, 1fr); gap: 20px; }
+  @media (max-width: 880px) { .bench { grid-template-columns: 1fr; } }
+
+  .rail { display: flex; flex-direction: column; gap: 2px; }
+  .rail h2 {
+    font-family: var(--mono); font-size: 11px; letter-spacing: .16em; font-weight: 500;
+    text-transform: uppercase; color: var(--mute); margin: 0 0 8px;
+  }
+  .lay {
+    appearance: none; border: 0; background: none; text-align: left; cursor: pointer;
+    font-family: var(--mono); font-size: 12.5px; color: var(--ink);
+    padding: 9px 12px; border-left: 2px solid transparent; border-radius: 0 3px 3px 0;
+    display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  }
+  .lay:hover { background: var(--panel); }
+  .lay[aria-pressed="true"] {
+    background: var(--panel); border-left-color: var(--accent); font-weight: 600;
+  }
+  .grouphead {
+    font-family: var(--mono); font-size: 9.5px; letter-spacing: .16em; text-transform: uppercase;
+    color: var(--mute); padding: 13px 12px 5px; border-top: 1px solid var(--hair); margin-top: 7px;
+  }
+  .grouphead:first-child { border-top: 0; margin-top: 0; padding-top: 0; }
+  .lay .tag {
+    font-size: 9.5px; letter-spacing: .1em; text-transform: uppercase; color: var(--mute);
+  }
+  .note {
+    font-size: 13.5px; color: var(--mute); padding: 10px 12px 2px;
+    border-left: 2px solid var(--hair); margin-top: 6px;
+  }
+  .keys {
+    margin-top: auto; padding-top: 18px; font-family: var(--mono); font-size: 11px;
+    color: var(--mute); line-height: 1.9;
+  }
+  .keys kbd {
+    font: inherit; border: 1px solid var(--hair); border-bottom-width: 2px;
+    border-radius: 3px; padding: 0 5px;
+  }
+
+  .picks { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+  .picks > span {
+    font-family: var(--mono); font-size: 10.5px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--mute); margin-right: 2px;
+  }
+  .chip {
+    appearance: none; cursor: pointer; font-family: var(--mono); font-size: 11.5px;
+    padding: 6px 11px; border-radius: 2px; background: none; color: var(--mute);
+    border: 1px solid var(--hair);
+  }
+  .chip:hover { color: var(--ink); }
+  .chip[aria-pressed="true"] {
+    color: #fff; border-color: transparent; font-weight: 600; background: var(--accent);
+  }
+
+  /* the hatch shows through wherever a cell has no data, so "missing" never reads as "zero" */
+  .stage {
+    position: relative; border-radius: 4px; aspect-ratio: 1 / 1; overflow: hidden;
+    cursor: grab; touch-action: none; border: 1px solid var(--hair);
+    background-color: var(--viewport);
+    background-image: repeating-linear-gradient(45deg,
+      rgba(127, 145, 165, .17) 0 1px, transparent 1px 7px);
+  }
+  .stage.dragging { cursor: grabbing; }
+  .duo { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+  .duo.solo { grid-template-columns: 1fr; }
+  .duo.solo #mapstage { display: none; }
+  @media (max-width: 700px) { .duo { grid-template-columns: 1fr; } }
+  #mapstage { background-image: none; }
+  .stage img {
+    position: absolute; inset: 0; width: 100%; height: 100%;
+    image-rendering: pixelated; transform-origin: 0 0; user-select: none;
+    -webkit-user-drag: none;
+  }
+  .badge {
+    position: absolute; top: 12px; left: 12px; z-index: 3; font-family: var(--mono);
+    font-size: 10.5px; letter-spacing: .14em; text-transform: uppercase; padding: 5px 9px;
+    border-radius: 2px; color: #fff; pointer-events: none; background: rgba(0, 0, 0, .55);
+    border-left: 3px solid var(--accent);
+  }
+  .scalebar {
+    position: absolute; left: 12px; bottom: 12px; z-index: 3; color: #fff;
+    font-family: var(--mono); font-size: 10px; letter-spacing: .1em; pointer-events: none;
+    background: rgba(0, 0, 0, .55); padding: 4px 8px; border-radius: 2px;
+  }
+
+  .legend {
+    margin-top: 12px; padding: 13px 16px; background: var(--panel);
+    border: 1px solid var(--hair); border-radius: 4px;
+    display: flex; flex-wrap: wrap; align-items: center; gap: 10px 22px;
+  }
+  .legend h4 {
+    margin: 0; font-family: var(--mono); font-size: 10px; letter-spacing: .14em;
+    text-transform: uppercase; color: var(--mute); font-weight: 500;
+    flex: 0 0 100%;
+  }
+  .swatch {
+    display: flex; align-items: center; gap: 7px; font-family: var(--mono); font-size: 11.5px;
+  }
+  .swatch i {
+    width: 15px; height: 15px; border-radius: 2px; flex: none;
+    border: 1px solid rgba(127, 145, 165, .35);
+  }
+  .swatch i.hatch {
+    background-color: #0d1117;
+    background-image: repeating-linear-gradient(45deg,
+      rgba(180, 198, 216, .55) 0 1px, transparent 1px 5px);
+  }
+  .ramp { display: flex; align-items: center; gap: 9px; font-family: var(--mono);
+          font-size: 11.5px; }
+  .ramp .bar {
+    width: min(260px, 40vw); height: 13px; border-radius: 2px;
+    border: 1px solid rgba(127, 145, 165, .35);
+  }
+  .legend .why { flex: 0 0 100%; font-family: var(--serif); font-size: 13.5px;
+                 color: var(--mute); margin: 2px 0 0; }
+
+  .card {
+    background: var(--panel); border: 1px solid var(--hair); border-radius: 4px;
+    padding: 16px 18px; margin-top: 14px; border-top: 3px solid var(--accent);
+  }
+  .card h3 {
+    margin: 0 0 2px; font-family: var(--mono); font-size: 12px; letter-spacing: .1em;
+    text-transform: uppercase; color: var(--accent);
+  }
+  .card .sub { margin: 0 0 14px; font-size: 13.5px; color: var(--mute); }
+  .card dl {
+    margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px 20px; font-family: var(--mono); font-variant-numeric: tabular-nums;
+  }
+  .card dt { font-size: 10px; letter-spacing: .1em; text-transform: uppercase;
+             color: var(--mute); }
+  .card dd { margin: 2px 0 0; font-size: 19px; font-weight: 600; }
+
+  .verdict {
+    margin-top: 20px; padding: 18px 20px; background: var(--panel);
+    border: 1px solid var(--hair); border-radius: 4px; max-width: 78ch;
+  }
+  .verdict p { margin: 0 0 10px; }
+  .verdict p:last-child { margin: 0; }
+  .verdict code {
+    font-family: var(--mono); font-size: .88em; background: var(--ground);
+    padding: 1px 5px; border-radius: 3px;
+  }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+  @media (prefers-reduced-motion: reduce) { * { transition: none !important; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <span class="eyebrow">Granville Island · Vancouver 2022 · <span id="hdr"></span></span>
+    <h1>Instances by multiplying views</h1>
+    <p class="lede">One interval width per <b>look</b>, multiplied together — a cell survives
+      only if <b>every</b> look saw structure there. What counts as a look is the choice below.
+      The rail is the method in order: <b>each look on its own</b>, then <b>× all of them</b>.
+      The multiply is where buildings turn into outlines and tree crowns into filled blobs, and
+      that difference is what separates them with no classification field.</p>
+  </header>
+
+  <div class="bench">
+    <div class="rail">
+      <h2>Layer</h2>
+      <div id="rail"></div>
+      <p class="note" id="note"></p>
+      <div class="keys">
+        <kbd>drag</kbd> pan · <kbd>wheel</kbd> zoom<br>
+        <kbd>R</kbd> reset · <kbd>1</kbd>–<kbd>9</kbd> layer
+      </div>
+    </div>
+
+    <div>
+      <div class="picks" id="picks"><span>channel</span></div>
+      <div class="duo" id="duo">
+        <div class="stage" id="mapstage">
+          <img id="imgMap" alt="Esri World Imagery of the same window">
+          <span class="badge">real map</span>
+          <span class="scalebar">Esri, Maxar — imagery date ≠ LiDAR date</span>
+        </div>
+        <div class="stage" id="stage">
+          <img id="img" alt="">
+          <span class="badge" id="badge"></span>
+          <span class="scalebar" id="scale"></span>
+        </div>
+      </div>
+      <div class="legend" id="legend"></div>
+      <div class="card" id="card"></div>
+    </div>
+  </div>
+
+  <div class="verdict" id="verdict"></div>
+</div>
+
+<script>
+const LAYERS = /*LAYERS*/, STATS = /*STATS*/, META = /*META*/, ORDER = /*ORDER*/,
+      LEGEND = /*LEGEND*/;
+const HUE = { line: "--line-ch", angle: "--angle-ch", look: "--look-ch" };
+const img = document.getElementById("img"), stage = document.getElementById("stage");
+const mapStage = document.getElementById("mapstage");
+const imgMap = document.getElementById("imgMap");
+if (META.map) { imgMap.src = META.map; }
+else { document.getElementById("duo").classList.add("solo"); }
+const panes = META.map ? [mapStage, stage] : [stage];
+let current = ORDER[0].id, chan = META.order[0], zoom = 1, ox = 0, oy = 0;
+
+document.getElementById("hdr").textContent =
+  META.returns.toLocaleString() + " returns · " + META.cols + "×" + META.rows +
+  " cells at " + META.pix + " m";
+
+if (META.order.length > 1) {
+  document.getElementById("picks").insertAdjacentHTML("beforeend",
+    META.order.map(c => `<button class="chip" data-ch="${c}"
+      aria-pressed="${chan === c}">${STATS[c].name}</button>`).join(""));
+} else {
+  document.getElementById("picks").style.display = "none";
+}
+
+const pct = v => v === null || v === undefined ? "—" : Math.round(v * 100) + "%";
+const met = v => v === null || v === undefined ? "—" : v.toFixed(3) + " m";
+const NODATA = '<span class="swatch"><i class="hatch"></i>no data — nothing landed here</span>';
+
+function legend() {
+  const L = LEGEND[chan][current];
+  let body;
+  if (L.kind === "cat") {
+    body = L.items.map(it =>
+      `<span class="swatch"><i style="background:${it.hex}"></i>${it.label}</span>`).join("");
+  } else if (L.kind === "ramp") {
+    body = `<span class="ramp"><span>${L.lo}</span>
+      <span class="bar" style="background:${L.css}"></span>
+      <span>${L.hi}</span></span>`;
+  } else {
+    body = L.items.map(it =>
+      `<span class="swatch"><i style="background:${it.hex}"></i>${it.label}</span>`).join("");
+  }
+  document.getElementById("legend").innerHTML =
+    `<h4>${L.title}</h4>${body}${NODATA}` + (L.why ? `<p class="why">${L.why}</p>` : "");
+}
+
+function rail() {
+  const looks = STATS[chan].looks || [];
+  const btn = (id, name, tag) =>
+    `<button class="lay" data-id="${id}" aria-pressed="${id === current}">
+       <span>${name}</span><span class="tag">${tag}</span></button>`;
+  const prod = ORDER.find(l => l.id === "product");
+  const rest = ORDER.filter(l => l.id !== "product");
+  document.getElementById("rail").innerHTML =
+    '<div class="grouphead">each look, then the multiply</div>' +
+    looks.map(l => btn(l.id, l.name, Math.round(l.cover * 100) + "%")).join("") +
+    btn(prod.id, `× all ${looks.length} — multiply`, "result") +
+    '<div class="grouphead">downstream</div>' +
+    rest.map(l => btn(l.id, l.name, l.shared ? "shared" : "per channel")).join("");
+}
+
+function layerInfo(id) {
+  if (id === "product") {
+    const n = (STATS[chan].looks || []).length;
+    return { name: `× all ${n} looks`, shared: false,
+             note: `Step 2: the ${n} maps above multiplied together (geometric mean over the `
+                 + "looks that have evidence). A cell keeps a value only where every look that "
+                 + "saw it agrees there is structure." };
+  }
+  const look = (STATS[chan].looks || []).find(l => l.id === id);
+  if (look) {
+    return { name: (META.statistic || "width") + " · " + look.name, shared: false,
+             note: `Step 1: the ${META.statistic || "interval width"} from this look alone, `
+                 + "before anything is combined. Hatch is where this look has no evidence." };
+  }
+  return ORDER.find(x => x.id === id);
+}
+
+function draw() {
+  if (!LAYERS[chan][current]) current = ORDER[0].id;   // group counts differ between channels
+  rail();
+  const l = layerInfo(current), s = STATS[chan];
+  document.documentElement.style.setProperty("--accent", `var(${HUE[chan] || "--line-ch"})`);
+  img.src = LAYERS[chan][current];
+  img.alt = `${l.name}, channels = ${s.name}`;
+  document.getElementById("badge").textContent =
+    l.shared ? l.name + " · same for every channel" : l.name + " · " + s.name;
+  document.getElementById("note").textContent = l.note;
+  document.querySelectorAll(".chip").forEach(b =>
+    b.setAttribute("aria-pressed", b.dataset.ch === chan));
+  legend();
+
+  document.getElementById("card").innerHTML = `
+    <h3>${s.name}</h3><p class="sub">${s.what} — ${s.note}</p>
+    <dl>
+      <div><dt>channels</dt><dd>${s.channels}</dd></div>
+      <div><dt>thinnest sees</dt><dd>${pct(s.min_cover)}</dd></div>
+      <div><dt>instances ≥30 m²</dt><dd>${s.instances}</dd></div>
+      <div><dt>is building</dt><dd>${pct(s.building)}</dd></div>
+      <div><dt>vegetation dropped</dt><dd>${pct(s.veg_dropped)}</dd></div>
+      <div><dt>product · crown</dt><dd>${met(s.crown)}</dd></div>
+      <div><dt>product · roof</dt><dd>${met(s.roof)}</dd></div>
+    </dl>`;
+}
+
+function verdict() {
+  const compass = Object.entries(META.compass).sort((a, b) => b[1] - a[1]);
+  const best = META.order.reduce((a, b) =>
+    (STATS[b].building ?? 0) > (STATS[a].building ?? 0) ? b : a);
+  const s0 = STATS[META.order[0]];
+  document.getElementById("verdict").innerHTML = `
+    <p><strong>Why two parts, and why these two.</strong> The survey looked from five discrete
+    azimuths only. Merging each look to its nearest bundle by circular distance gives
+    ${s0.labels ? "" : ""}two parts that <em>both</em> cover ~95% of the window — the most parts
+    for which that is possible, since the third direction (271°) reaches only 27% and an eastern
+    look does not exist at all. 93.5% of cells get the identical 2-look test.</p>
+    ${compass.length ? `<p><strong>The ceiling.</strong> Every return arrived from
+    ${compass.map(([k, v]) => `<b>the ${k} ${pct(v)}</b>`).join(", ")} — and from nowhere else.
+    No cell here was ever viewed from the east, so no east-facing wall exists in this data at
+    any density. That is the flight plan, not the processing.</p>` : ""}
+    <p>Nothing here reads the survey's <code>classification</code> field. The building and
+    vegetation percentages are scored against it <em>afterwards</em>, as a check.</p>`;
+}
+
+function transform() {
+  const t = `translate(${ox}px, ${oy}px) scale(${zoom})`;
+  img.style.transform = t;
+  if (META.map) imgMap.style.transform = t;
+  document.getElementById("scale").textContent =
+    "≈ " + Math.round(META.cols / zoom / 4) + " m across ¼ view";
+}
+
+document.getElementById("rail").addEventListener("click", e => {
+  const b = e.target.closest(".lay");
+  if (b) { current = b.dataset.id; draw(); }
+});
+document.getElementById("picks").addEventListener("click", e => {
+  const b = e.target.closest(".chip");
+  if (b) { chan = b.dataset.ch; draw(); }
+});
+
+let panning = false, ppx = 0, ppy = 0;
+for (const st of panes) {
+  st.addEventListener("pointerdown", e => {
+    panning = true; st.classList.add("dragging");
+    st.setPointerCapture(e.pointerId);
+    ppx = e.clientX; ppy = e.clientY;
+  });
+  st.addEventListener("wheel", e => {
+    e.preventDefault();
+    const r = st.getBoundingClientRect();
+    const cx = e.clientX - r.left, cy = e.clientY - r.top;
+    const next = Math.max(1, Math.min(24, zoom * Math.exp(-e.deltaY * 0.0015)));
+    const kk = next / zoom;
+    ox = cx - (cx - ox) * kk; oy = cy - (cy - oy) * kk;
+    zoom = next;
+    if (zoom === 1) { ox = 0; oy = 0; }
+    transform();
+  }, { passive: false });
+}
+window.addEventListener("pointermove", e => {
+  if (!panning) return;
+  ox += e.clientX - ppx; oy += e.clientY - ppy;
+  ppx = e.clientX; ppy = e.clientY;
+  transform();
+});
+window.addEventListener("pointerup", () => {
+  panning = false; panes.forEach(s => s.classList.remove("dragging"));
+});
+window.addEventListener("keydown", e => {
+  if (e.key === "r" || e.key === "R") { zoom = 1; ox = 0; oy = 0; transform(); }
+  const all = [...(STATS[chan].looks || []).map(l => l.id), ...ORDER.map(l => l.id)];
+  const n = parseInt(e.key, 10);
+  if (n >= 1 && n <= Math.min(9, all.length)) { current = all[n - 1]; draw(); }
+});
+
+draw(); verdict(); transform();
+</script>
