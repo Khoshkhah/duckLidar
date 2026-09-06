@@ -17,6 +17,7 @@ questioned for optimization part by part.
 - [Stage 5 — labeling](stage5-labeling.md)
   - [Stage 5 — cost per task on the old area](stage5-cost.md)
   - [Stage 5 — the tables, and the process that writes each one](stage5-tables.md)
+  - [Stage 5 — at window scale: partition + halo, the forest's tail, the area as a parameter](stage5-window.md) — **proposal 2026-09-05**
 - [Stage 6 — instances](stage6-instances.md)
 - [Stage 7 — scene build](stage7-scene.md)
 - [Stage 8 — shadows](stage8-shadows.md)
