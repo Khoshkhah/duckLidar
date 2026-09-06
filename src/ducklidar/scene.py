@@ -658,6 +658,46 @@ def read_cityjsonseq(path, lod="2.2"):
     return out
 
 
+def read_cityjson(path, lod="2.2"):
+    """Parse a PACKED CityJSON file into ``{object id: (vertices, triangles)}``.
+
+    Same content as :func:`read_cityjsonseq`, different container: the packed
+    form carries one ``vertices`` array for the whole dataset and every object
+    indexes into it, instead of one feature per line with its own vertices.
+    roofer emits the *stream*; the lab's ``cityjson_pack.py`` packs it — and
+    when the stream lives in a temp directory, the packed file is the only copy
+    that survives a reboot. Which is exactly what happened here, so this reader
+    is what recovers real LoD2.2 roof planes without the binary.
+
+    Faces are ear-clipped in the plane of their Newell normal, as in the
+    streamed reader, so non-convex roof faces triangulate correctly.
+    """
+    import json
+    from pathlib import Path
+
+    doc = json.loads(Path(path).read_text())
+    tr = doc.get("transform", {})
+    scale = np.array(tr.get("scale", [1.0, 1.0, 1.0]))
+    trans = np.array(tr.get("translate", [0.0, 0.0, 0.0]))
+    verts = np.array(doc["vertices"], float) * scale + trans
+    out = {}
+    for oid, obj in doc.get("CityObjects", {}).items():
+        T = []
+        for geom in obj.get("geometry", []):
+            if str(geom.get("lod")) != str(lod):
+                continue
+            b = geom["boundaries"]
+            # Solid: [shell][face][ring]; MultiSurface: [face][ring]
+            shells = b if geom.get("type") == "Solid" else [b]
+            for shell in shells:
+                for face in shell:
+                    if face and isinstance(face[0], list):
+                        T += _face_tris(verts, face[0])
+        if T:
+            out[oid] = (verts, np.array(T, np.int64))
+    return out
+
+
 def sat_lift(soup, cols, rgb, x0, y1, res):
     """Deshadow per-vertex paint, witnessed by an orthorectified satellite.
 

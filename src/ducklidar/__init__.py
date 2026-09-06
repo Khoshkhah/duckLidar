@@ -37,6 +37,22 @@ from .segment import (COMPASS, WIDTH_FLOOR, angle_rank, boundary, bridge_deck,
                       viewed_from)
 from .viz import compare_channels, default_channels, notebook_view
 from .read import EXTRAS, NOISE, box, parquet_path, read, to_parquet
+from .overture import pier_ways
+from .graph import euclidean_mst, local_edges, read_mst_parts
+from .neighbourhood import balanced_boxes, knn, shape_features
+from . import objects  # noqa: F401
+from .labeling import (CAT_FOLIAGE, CAT_OTHER, CAT_WALL, DECIDE, SPEC, SYS_DECK,
+                       SYS_GROUND, SYS_NONE, SYS_WATER, ColumnSupport, cell_components,
+                       cell_evidence, column_support,
+                       cell_of, convict_glass, corridor_cells, cube_scatter, decide_labels,
+                       flood_bodies, footprint_cells, footprint_ids, forest_graph, glass_geodesic,
+                       glass_geodesic_blocks,
+                       ground_cells, knn_csr, map_vetoes, marina_superstructure, path_shares,
+                       car_split,
+                       raft_split,
+                       path_shares_from_pred,
+                       support_forest, water_cells)
+from .report import stage_report
 from . import dem as dem_mod          # for CROSSOVER, which tests and tools cite
 from .dem import building_level, dem, fill, footprint, ndsm
 from .trajectory import pulses, sensor_track, tracks
@@ -49,5 +65,10 @@ __all__ = [
     "field_guide", "parquet_path", "plan", "rasterize", "read", "section", "score_against", "shape_for", "surfaces", "to_parquet",
     "building_level", "footprint", "compare_channels", "default_channels", "notebook_view",
     "edge_strength", "instances",
-    "look_azimuth", "void_report",
+    "balanced_boxes", "cell_components", "cell_evidence", "cell_of", "forest_graph", "knn_csr", "support_forest", "euclidean_mst", "ground_cells", "knn", "local_edges", "look_azimuth", "pier_ways", "read_mst_parts", "shape_features", "stage_report", "void_report",
+    "CAT_FOLIAGE", "CAT_OTHER", "CAT_WALL", "SYS_DECK", "SYS_GROUND", "SYS_NONE", "SYS_WATER",
+    "ColumnSupport", "column_support",
+    "cube_scatter", "knn_csr", "path_shares", "path_shares_from_pred", "support_forest",
+    "car_split", "footprint_cells", "footprint_ids", "map_vetoes",
+    "marina_superstructure", "raft_split",
 ]

@@ -105,7 +105,7 @@ def ground_filter(pts, *, cloth_resolution=None, class_threshold=None, rigidness
     csf.setPointCloud(xyz)
 
     ground, non_ground = CSF.VecInt(), CSF.VecInt()
-    csf.do_filtering(ground, non_ground)
+    csf.do_filtering(ground, non_ground, exportCloth=False)   # else CSF dumps cloth_nodes.txt in cwd
 
     picked = np.zeros(len(xyz), dtype=bool)
     picked[np.asarray(ground, dtype="int64")] = True

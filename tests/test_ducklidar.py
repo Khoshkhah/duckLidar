@@ -1036,6 +1036,45 @@ def test_mesh_bridges_connects_islands_with_measured_spans():
     assert len(blen) == 0
 
 
+def test_euclidean_mst_matches_brute_force(tmp_path):
+    """The MST is defined on the COMPLETE graph, so brute force is the only
+    proof: scipy over the full distance matrix. Two blobs 30 m apart exercise
+    both regimes at once — Kruskal on the kNN candidates inside the 2.5 m cap,
+    the bounded ball search for the one link that bridges the gap. Distances
+    are quantised to float32 first, because f32 is the weight the algorithm
+    has (`knn.parquet` stores `len` as f32); ties then fall to (src, dst)."""
+    from scipy.sparse.csgraph import minimum_spanning_tree
+    from ducklidar.graph import read_mst_parts
+
+    rng = np.random.default_rng(7)
+    P = np.vstack([rng.uniform(0, 5, (150, 3)),
+                   rng.uniform(0, 5, (150, 3)) + [30.0, 0, 0]])
+
+    d = np.linalg.norm(P[:, None, :] - P[None, :, :], axis=-1).astype(np.float32)
+    t = minimum_spanning_tree(d.astype(np.float64)).tocoo()
+    want = {(min(i, j), max(i, j)) for i, j in zip(t.row, t.col)}
+
+    src, dst = map(np.concatenate, zip(*dl.local_edges(P, k=10, cap=2.5)))
+    ln = np.linalg.norm(P[src] - P[dst], axis=1).astype(np.float32)
+
+    def read_box(bbox):
+        m = ((P[:, 0] >= bbox[0]) & (P[:, 0] <= bbox[2])
+             & (P[:, 1] >= bbox[1]) & (P[:, 1] <= bbox[3]))
+        return P[m], np.flatnonzero(m).astype(np.int64)
+
+    dl.euclidean_mst(iter([(src.astype(np.int64), dst.astype(np.int64), ln)]),
+                     len(P), read_box, [np.arange(len(P))],
+                     sweep_bbox=(P[:, 0].min(), P[:, 1].min(),
+                                 P[:, 0].max(), P[:, 1].max()),
+                     work=tmp_path / "mst", log=None)
+    a, b, w = read_mst_parts(tmp_path / "mst")
+    got = {(min(i, j), max(i, j)) for i, j in zip(a, b)}
+
+    assert len(got) == len(P) - 1, "a spanning tree has |V|-1 edges"
+    assert got == want, "the exact EMST, not merely one of the same weight"
+    assert w.max() > 20.0, "the blob-to-blob link is beyond the kNN cap"
+
+
 def test_wall_report_decides_walls_doors_and_windows():
     """Kaveh's spec (2026-08-01): per side, DECIDE — wall or not; door and
     where; windows and where. Absence framed by evidence is an opening;
@@ -1206,3 +1245,659 @@ def test_checked_walls_puts_roofers_walls_on_trial():
         "only the roof survives on a structure the laser sees under"
     cells = parts[-1][0]
     assert (cells[:, 0] > 11.9).any(), "the post's cells remain"
+
+
+def test_pier_ways(tmp_path):
+    """A synthetic duckOverture extract: the query, the clip, the ring, the coverage guard."""
+    duckdb = pytest.importorskip("duckdb")
+    pytest.importorskip("pyproj")
+    from pyproj import Transformer
+
+    to_ll = Transformer.from_crs(26910, 4326, always_xy=True)
+    B = dl.box(490289, 5457557, 250)
+
+    def ls(pts, kind="LINESTRING"):
+        body = ", ".join("%.9f %.9f" % to_ll.transform(x, y) for x, y in pts)
+        return (kind + "(" + body + ")" if kind == "LINESTRING"
+                else kind + "((" + body + "))")
+
+    inside = [(490300.0, 5457500.0), (490350.0, 5457560.0)]
+    ring = [(490200.0, 5457400.0), (490240.0, 5457400.0), (490240.0, 5457430.0),
+            (490200.0, 5457430.0), (490200.0, 5457400.0)]
+    outside = [(490289.0, 5459000.0), (490350.0, 5459000.0)]
+
+    db = str(tmp_path / "toy_overture.duckdb")
+    con = duckdb.connect(db)
+    con.execute("INSTALL spatial; LOAD spatial")
+    blo = to_ll.transform(B[0] - 500, B[1] - 500)
+    bhi = to_ll.transform(B[2] + 500, B[3] + 500)
+    con.execute("create table boundary as select ST_MakeEnvelope(?, ?, ?, ?) as geom",
+                [*blo, *bhi])
+    con.execute("create schema base")
+    con.execute("""
+        create table base.infrastructure as
+        select [{'record_id': rid}] as sources, {'primary': nm} as names,
+               MAP(ks, vs) as source_tags, 'pier' as class,
+               ST_GeomFromText(wkt) as geometry,
+               {'xmin': ST_XMin(ST_GeomFromText(wkt)),
+                'xmax': ST_XMax(ST_GeomFromText(wkt)),
+                'ymin': ST_YMin(ST_GeomFromText(wkt)),
+                'ymax': ST_YMax(ST_GeomFromText(wkt))} as bbox
+        from (values
+          ('w42@3', 'A Dock', ['man_made', 'floating'], ['pier', 'yes'], ?),
+          ('w43@1', '',       ['man_made', 'area'],     ['pier', 'yes'], ?),
+          ('w44@1', 'Afar',   ['man_made'],             ['pier'],        ?),
+          ('msft/7', 'NotOSM', ['man_made'],            ['pier'],        ?)
+        ) t(rid, nm, ks, vs, wkt)""",
+        [ls(inside), ls(ring, "POLYGON"), ls(outside), ls(inside)])
+    con.close()
+
+    ways = dl.pier_ways(db, B)
+    by_id = {w["id"]: w for w in ways}
+    assert set(by_id) == {42, 43}, "outside-box and non-OSM rows are excluded"
+    assert by_id[42]["name"] == "A Dock" and by_id[42]["floating"] == "yes"
+    assert all(abs(g[0] - p[0]) < 0.02 and abs(g[1] - p[1]) < 0.02
+               for g, p in zip(by_id[42]["coords"], inside)), \
+        "round-trip through 4326 stays sub-cm"
+    assert by_id[43]["area"] == "yes" and len(by_id[43]["coords"]) == 5, \
+        "a polygon pier yields its closed exterior ring"
+
+    with pytest.raises(ValueError):
+        dl.pier_ways(db, dl.box(490289, 5457557, 5000))
+
+
+def test_read_multi_tile(tmp_path):
+    """A window straddling two tiles gets both tiles' points; distant tiles cost a header."""
+    import laspy
+
+    def write_tile(path, x0):
+        hdr = laspy.LasHeader(point_format=3, version="1.2")
+        hdr.scales = [0.001, 0.001, 0.001]
+        hdr.offsets = [x0, 0.0, 0.0]
+        las = laspy.LasData(hdr)
+        las.x = np.arange(x0 + 5.0, x0 + 100.0, 10.0)   # 10 points, 5..95 within the tile
+        las.y = np.full(10, 50.0)
+        las.z = np.full(10, 1.0)
+        las.classification = np.full(10, 2, dtype=np.uint8)
+        las.write(str(path))
+        return path
+
+    a = write_tile(tmp_path / "a.las", 0.0)      # tile x 0..100
+    b = write_tile(tmp_path / "b.las", 100.0)    # tile x 100..200
+    far = write_tile(tmp_path / "far.las", 9000.0)
+
+    win = (80.0, 0.0, 120.0, 100.0)              # straddles the a|b border at x=100
+    pts = dl.read([a, b, far], win)
+    assert sorted(pts["x"]) == [85.0, 95.0, 105.0, 115.0], \
+        "both sides of the border answer; the far tile contributes nothing"
+
+    # same answer when one side is served by its parquet sidecar at a foreign path
+    side = dl.to_parquet(b, tmp_path / "elsewhere.parquet")
+    pts2 = dl.read([a, side, far], win)
+    assert sorted(pts2["x"]) == sorted(pts["x"])
+
+    # the sidecar carries pid — the point's row in its file, the join key for
+    # derived tables — and a window read can ask for it
+    withid = dl.read(side, win, fields=("pid",))
+    assert set(withid) == {"x", "y", "z", "classification", "pid"}
+    full = dl.read(side, (0.0, 0.0, 1000.0, 1000.0), fields=("pid",))
+    assert sorted(full["pid"]) == list(range(10)), "pid is a permutation of file rows"
+
+    empty = dl.read([a, b], (300.0, 0.0, 400.0, 100.0))
+    assert len(empty["x"]) == 0 and "z" in empty
+
+    assert dl.box(10.0, 20.0, 2.0, 1.0) == (8.0, 19.0, 12.0, 21.0), \
+        "rectangular study windows: half_y caps the y reach"
+
+
+def test_local_edges():
+    """The mesh graph's local half: k nearest within the cap, chunking invisible."""
+    pytest.importorskip("scipy")
+
+    xyz = np.array([[0.0, 0, 0], [1.0, 0, 0], [2.0, 0, 0], [100.0, 0, 0]])
+    got = {(int(a), int(b))
+           for src, dst in dl.local_edges(xyz, k=2, cap=2.5)
+           for a, b in zip(src, dst)}
+    assert got == {(0, 1), (0, 2), (1, 0), (1, 2), (2, 0), (2, 1)}, \
+        "three chained points interconnect; the far point reaches nothing"
+
+    chunked = [dl.local_edges(xyz, k=2, cap=2.5, chunk=1),
+               dl.local_edges(xyz, k=2, cap=2.5)]
+    sets = [{(int(a), int(b)) for s, d in g for a, b in zip(s, d)} for g in chunked]
+    assert sets[0] == sets[1] == got, "chunk size never changes the edge set"
+
+    nn = dl.knn(xyz, k=3)
+    via_nn = {(int(a), int(b))
+              for s, d in dl.local_edges(xyz, k=2, cap=2.5, nn=nn)
+              for a, b in zip(s, d)}
+    assert via_nn == got, "edges derived from a cached knn match the direct build"
+
+
+def test_knn_shape_features():
+    """The kNN level: a roof is planar-horizontal, a wall planar-vertical, a line linear."""
+    pytest.importorskip("scipy")
+    rng = np.random.default_rng(0)
+
+    def feats(P):
+        dist, idx = dl.knn(P, k=8)
+        e1, e2, e3, nz = dl.shape_features(P, idx)
+        return e1.mean(), e2.mean(), e3.mean(), nz.mean()
+
+    g = np.stack(np.meshgrid(np.arange(10.0), np.arange(10.0)), -1).reshape(-1, 2)
+    roof = np.c_[g, np.full(len(g), 5.0) + rng.normal(0, 0.01, len(g))]
+    e1, e2, e3, nz = feats(roof)
+    assert e3 < 0.01 and nz > 0.98, "flat horizontal: no thickness, normal straight up"
+
+    wall = np.c_[g[:, :1], np.full((len(g), 1), 2.0), g[:, 1:]]
+    wall[:, 1] += rng.normal(0, 0.01, len(g))
+    *_, e3w, nzw = feats(wall)
+    assert e3w < 0.01 and nzw < 0.02, "flat vertical: normal horizontal"
+
+    line = np.c_[np.arange(0, 50, 0.5), np.zeros(100), np.zeros(100)]
+    e1l, e2l, *_ = feats(line)
+    assert e1l > 0.98 and e2l < 0.02, "a line is all first eigenvalue"
+
+
+def test_balanced_boxes(tmp_path):
+    """Partitions follow the data: a dense corner gets small boxes, leaves balance."""
+    duckdb = pytest.importorskip("duckdb")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(1)
+    dense = rng.uniform(0, 250, (80_000, 2))          # a packed quarter
+    sparse = rng.uniform(0, 1000, (20_000, 2))        # thin everywhere else
+    xy = np.vstack([dense, sparse])
+    f = str(tmp_path / "pts.parquet")
+    pq.write_table(pa.table({"x": xy[:, 0], "y": xy[:, 1]}), f)
+
+    boxes = dl.balanced_boxes([f], (0.0, 0.0, 1000.0, 1000.0), 20_000)
+    counts = [b[4] for b in boxes]
+    assert all(c <= 20_000 for c in counts), "every leaf under the cap"
+    assert sum(counts) == 100_000, "leaves partition the points exactly"
+    areas = {(b[2] - b[0]) * (b[3] - b[1]) for b in boxes}
+    assert max(areas) / min(areas) > 4, "dense regions got smaller boxes"
+
+
+def test_cell_evidence_and_ground(tmp_path):
+    """Stage 5 on tables: GROUP BY evidence, then one global cloth on the cells."""
+    duckdb = pytest.importorskip("duckdb")
+    pytest.importorskip("CSF")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(2)
+    gx = rng.uniform(0, 100, (40_000, 2))                     # ground, z ~ 10
+    rx = rng.uniform(30, 60, (10_000, 2))                     # roof block, z ~ 30
+    x = np.r_[gx[:, 0], rx[:, 0]]
+    y = np.r_[gx[:, 1], rx[:, 1]]
+    z = np.r_[np.full(40_000, 10.0), np.full(10_000, 30.0)]
+    z += rng.normal(0, 0.02, len(z))
+    f = str(tmp_path / "pts.parquet")
+    pq.write_table(pa.table({
+        "x": x, "y": y, "z": z,
+        "classification": np.r_[np.full(40_000, 2), np.full(10_000, 6)].astype(np.uint8),
+        "return_number": np.ones(len(z), np.uint8),
+        "number_of_returns": np.ones(len(z), np.uint8)}), f)
+
+    bbox = (0.0, 0.0, 100.0, 100.0)
+    cells = dl.cell_evidence([f], bbox, pix=1.0)
+    assert cells.num_rows > 9_000, "nearly every 1 m cell is occupied"
+    d = {c: cells[c].to_numpy() for c in cells.column_names}
+    assert int(d["n"].sum()) == 50_000
+    assert float(d["split_share"].max()) == 0.0, "single-return synthetic"
+
+    cell, gz, _grid = dl.ground_cells(cells, bbox, pix=1.0)
+    inside = (d["min_z"] > 25)                    # roof-only cells (ground hidden)
+    assert inside.any()
+    assert np.allclose(gz[~inside], 10.0, atol=0.5), "open ground recovered"
+    assert np.allclose(gz[inside], 10.0, atol=1.5), \
+        "under the roof the cloth bridges at ground level, not roof level"
+
+    hag = np.full(len(gz), np.nan)                # the per-point join, in miniature
+    pc = dl.cell_of(x, y, bbox)
+    m = {int(c): g for c, g in zip(cell, gz)}
+    hag = z - np.array([m[int(c)] for c in pc])
+    assert (hag[-10_000:] > 15).mean() > 0.95, "roof points stand ~20 m above ground"
+
+
+def test_cell_components(tmp_path):
+    """Region questions on the cell grid: two ponds are two bodies, globally."""
+    pytest.importorskip("duckdb")
+    pytest.importorskip("scipy")
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+
+    rng = np.random.default_rng(3)
+    def blob(cx, cy, r, n):
+        a = rng.uniform(0, 2 * np.pi, n); d = rng.uniform(0, r, n)
+        return np.c_[cx + d * np.cos(a), cy + d * np.sin(a)]
+    land = rng.uniform(0, 200, (30_000, 2))
+    pond1, pond2 = blob(50, 50, 15, 8_000), blob(150, 150, 10, 5_000)
+    xy = np.vstack([land, pond1, pond2])
+    cls = np.r_[np.full(30_000, 2), np.full(13_000, 9)].astype(np.uint8)
+    f = str(tmp_path / "p.parquet")
+    pq.write_table(pa.table({"x": xy[:, 0], "y": xy[:, 1],
+                             "z": np.where(cls == 9, 0.0, 5.0),
+                             "classification": cls,
+                             "return_number": np.ones(len(cls), np.uint8),
+                             "number_of_returns": np.ones(len(cls), np.uint8)}), f)
+
+    bbox = (0.0, 0.0, 200.0, 200.0)
+    cells = dl.cell_evidence([f], bbox)
+    wet = cells["n_water"].to_numpy() > 0
+    body = dl.cell_components(cells, wet, bbox)
+    ids = set(body[wet]) - {0}
+    assert len(ids) == 2, "two ponds, two bodies"
+    assert (body[~wet] == 0).all(), "dry cells belong to no body"
+
+
+def test_stage_report(tmp_path):
+    log = tmp_path / "pipeline_report.log"
+    line = dl.stage_report("stage4", {"points": 168377550, "components": 9548,
+                                      "gate": "99.79%"}, log=log)
+    dl.stage_report("stage5", {"leaves": 10}, log=log)
+    text = log.read_text().splitlines()
+    assert len(text) == 2 and text[0] == line
+    assert "points=168,377,550" in text[0] and "gate=99.79%" in text[0]
+
+
+def test_column_support_separates_a_truck_from_an_eave():
+    """The context per-point rules lack: in 2-D a truck and a one-storey eave
+    are the same cell (ground below, roof above). The column is not — under the
+    eave there is 2 m of walkable air, so it fails the continuity test."""
+    bbox = (0.0, 0.0, 3.0, 1.0)                      # 1 m cells; 2 is returnless
+    cells = {"cell": np.array([0, 1]), "ground_z": np.array([10.0, 10.0])}
+    lvl = lambda z: int(np.floor(z / 0.5))           # noqa: E731 — the voxel table's level
+    truck = np.arange(lvl(10.0), lvl(13.0))          # matter 0-3 m, continuous
+    eave = np.r_[lvl(10.0),                          # a wall foot / the yard
+                 np.arange(lvl(12.5), lvl(13.5))]    # ...air, then the overhang
+    voxels = {"cell": np.r_[np.zeros(len(truck), int), np.ones(len(eave), int)],
+              "level": np.r_[truck, eave]}
+
+    s = dl.column_support(voxels, cells, bbox, 1.0)
+    assert s.supported(0, 3.0) and s.gap_below(0, 3.0) == 0.0
+    assert not s.supported(1, 3.0)
+    assert s.gap_below(1, 3.0) == pytest.approx(2.0), "0.5-2.5 m is empty"
+    assert not s.supported(2, 3.0), "a cell with no evidence is air, not matter"
+
+
+def test_corridor_offbox_way_paints_no_corner():
+    """A width class whose ways all fall outside the box must contribute
+    nothing. distance_transform_edt of an all-True grid measures distance to
+    the OUTSIDE, so the empty line used to paint a radius-r quarter-disc in
+    the corner (83 phantom cells in the reference tile)."""
+    bbox = (0.0, 0.0, 50.0, 50.0)
+    cells = {"cell": np.arange(2500), "max_z": np.zeros(2500)}
+    ways = {"ways": [{"highway": "secondary", "lanes": "5",
+                      "coords": [[-500.0, -500.0], [-400.0, -400.0]]}]}
+    mask, grid = dl.corridor_cells(ways, cells, np.zeros(2500), bbox)
+    assert not grid.any(), f"{int(grid.sum())} phantom corner cells"
+
+
+def test_path_shares_from_pred_matches_a_hand_built_forest():
+    """The stored-forest shares must equal what walking the chain by hand gives.
+
+    Chain 0 <- 1 <- 2 <- 3 with 0 the root, and cats marking node 1 as WALL and
+    node 2 as FOLIAGE. Node 3's path crosses 2 (foliage) then 1 (wall) then 0
+    (other), so its shares are 1/3 each.
+    """
+    import numpy as np
+
+    import ducklidar as dl
+    from ducklidar.labeling import CAT_FOLIAGE, CAT_OTHER, CAT_WALL
+
+    pred = np.array([-1, 0, 1, 2], np.int64)
+    depth = np.array([0, 1, 2, 3], np.int32)
+    cats = np.array([CAT_OTHER, CAT_WALL, CAT_FOLIAGE, CAT_OTHER], np.uint8)
+    bsh, vsh = dl.path_shares_from_pred(pred, depth, cats)
+
+    assert bsh[0] == 0.0 and vsh[0] == 0.0          # a root is never refined
+    assert bsh[1] == 0.0 and vsh[1] == 0.0          # crosses only node 0 (other)
+    assert bsh[2] == 0.5 and vsh[2] == 0.0          # crosses 1 (wall) + 0 (other)
+    assert abs(bsh[3] - 1 / 3) < 1e-12              # crosses 2, 1, 0
+    assert abs(vsh[3] - 1 / 3) < 1e-12
+
+
+def test_path_shares_from_pred_totals_are_the_depth():
+    """One category everywhere ⇒ every reached node's share is exactly 1.
+
+    This is the invariant that validated the operator against the real
+    42.8 M-vertex forest: the histogram total must BE the stored depth.
+    """
+    import numpy as np
+
+    import ducklidar as dl
+    from ducklidar.labeling import CAT_WALL
+
+    n = 500
+    pred = np.arange(-1, n - 1, dtype=np.int64)      # one long chain
+    depth = np.arange(n, dtype=np.int32)
+    cats = np.full(n, CAT_WALL, np.uint8)
+    bsh, _ = dl.path_shares_from_pred(pred, depth, cats)
+    assert (bsh[depth > 0] == 1.0).all()
+    assert bsh[0] == 0.0
+
+
+def test_footprint_ids_agrees_with_footprint_cells():
+    """`footprint_ids != fill` must be exactly `footprint_cells`, and carry ids."""
+    import numpy as np
+
+    import ducklidar as dl
+
+    bbox = (0.0, 0.0, 10.0, 10.0)
+    polys = [{"id": 42, "coords": [[1, 1], [4, 1], [4, 4], [1, 4]]},
+             {"id": 7, "coords": [[6, 6], [9, 6], [9, 9], [6, 9]]}]
+    idx = dl.footprint_ids(polys, bbox, 1.0)          # default: polygon INDEX
+    cells = dl.footprint_cells(polys, bbox, 1.0)
+    assert idx.shape == cells.shape
+    assert ((idx != -1) == cells).all()
+    assert set(np.unique(idx)) == {-1, 0, 1}
+    ids = dl.footprint_ids(polys, bbox, 1.0, key="id")  # explicit int ids
+    assert set(np.unique(ids)) == {-1, 7, 42}
+    # a UUID id must not raise under the default
+    uu = [{"id": "f8ae588d-cf44-4b97-8ff2-6f7bd9509c29",
+           "coords": polys[0]["coords"]}]
+    assert set(np.unique(dl.footprint_ids(uu, bbox, 1.0))) == {-1, 0}
+
+
+def test_raft_split_separates_two_boats_on_one_pontoon():
+    """Two hulls touching at pontoon level must come out as two ids.
+
+    The case the class-induced subgraph cannot cut: everything is connected
+    within ~1 m of the water, so only height separates the vessels.
+    """
+    import numpy as np
+
+    import ducklidar as dl
+
+    rng = np.random.default_rng(0)
+    # a 30 x 4 m pontoon at z=0, with two 6 m hulls rising 2.5 m, 12 m apart
+    px, py, pz = [], [], []
+    gx, gy = np.meshgrid(np.arange(0, 30, 0.25), np.arange(0, 4, 0.25))
+    px.append(gx.ravel()); py.append(gy.ravel())
+    pz.append(np.zeros(gx.size))
+    for cx in (5.0, 21.0):
+        hx, hy = np.meshgrid(np.arange(cx, cx + 6, 0.25), np.arange(0, 3, 0.25))
+        px.append(hx.ravel()); py.append(hy.ravel())
+        pz.append(np.full(hx.size, 2.5))
+    px = np.concatenate(px); py = np.concatenate(py); pz = np.concatenate(pz)
+    px += rng.normal(0, 0.01, px.size)
+
+    ids = dl.raft_split(px, py, pz)
+    assert len(ids) == len(px)
+    hull_a = ids[(px > 5) & (px < 11) & (pz > 2)]
+    hull_b = ids[(px > 21) & (px < 27) & (pz > 2)]
+    assert len(np.unique(hull_a)) == 1 and len(np.unique(hull_b)) == 1, \
+        "each hull must be ONE id — h-maxima should merge bumps on one ridge"
+    assert hull_a[0] != hull_b[0], "the two hulls must not share an id"
+
+
+def test_flood_deck_tol_takes_the_covered_slip_and_leaves_the_beach():
+    """A marina roofed by its own floats joins the body; dry land does not.
+
+    Three strips at the same 1 m WORK grid, all south-up: open water at
+    -1.0, a covered slip whose cloth settled on the pontoon at +0.5 with NO
+    class-2 return, and a beach also at +0.5 that IS classed ground. The
+    strict tol=0.4 admits neither of the raised strips; deck_tol=1.0 admits
+    the slip only — n_ground == 0 is the whole guard.
+    """
+    pytest.importorskip("scipy")
+    import pyarrow as pa
+
+    bbox, nx, ny = (0.0, 0.0, 20.0, 20.0), 20, 20
+    cell = np.arange(nx * ny)
+    col = cell % nx
+    surface = np.where(col < 5, -1.0, 0.5).reshape(ny, nx)   # slip and beach both +0.5
+    n_ground = np.where(col < 10, 0, 7)                      # only the beach is ground
+    cells = pa.table({"cell": cell.astype(np.int64),
+                      "n": np.ones(nx * ny, np.int64),
+                      "n_ground": n_ground.astype(np.int64)})
+    seeds = col < 5                                          # the open water seeds
+
+    _, off = dl.flood_bodies(cells, seeds, surface, {0: 0.0}, bbox)
+    off = off.reshape(ny, nx) > 0
+    assert off[:, :5].all() and not off[:, 5:].any(), "default behaviour is unchanged"
+
+    _, grid = dl.flood_bodies(cells, seeds, surface, {0: 0.0}, bbox, deck_tol=1.0)
+    grid = grid.reshape(ny, nx)
+    on = grid > 0
+    assert on[:, 5:10].all(), "the covered slip joins the body"
+    assert not on[:, 10:].any(), "the beach is class-2 ground and stays dry"
+    assert set(grid[on].tolist()) == {1}, "slip and open water are ONE body"
+
+
+# ===========================================================================
+# ONE MODEL PER OBJECT TYPE, and every model states its KIND (2026-08-05).
+# The audit these replace found four types borrowing another type's recipe:
+# bridge -> solid_25d from below the waterline (v1's blackout bug), small and
+# on_bridge -> car_mesh, glass -> footprint_prism.
+# ===========================================================================
+
+def _deck_points(n=4000, seed=3, girder=True, piers=False):
+    """A 40 x 12 m deck at z=20, optionally with the girder returns that
+    measure its depth, and/or two pier stumps standing down to the water."""
+    rng = np.random.default_rng(seed)
+    out = [np.column_stack([rng.uniform(0, 40, n), rng.uniform(0, 12, n),
+                            np.full(n, 20.0)])]
+    if girder:                        # fascia returns 1.0-1.4 m under the deck
+        m = 600
+        out.append(np.column_stack([rng.uniform(0, 40, m),
+                                    rng.choice([0.4, 11.6], m),
+                                    rng.uniform(18.6, 19.0, m)]))
+    if piers:
+        for cx in (10.0, 30.0):
+            m = 400
+            out.append(np.column_stack([
+                cx + rng.uniform(-1.5, 1.5, m), rng.uniform(4, 8, m),
+                rng.uniform(0.5, 16.0, m)]))
+    return np.vstack(out)
+
+
+def test_bridge_deck_is_a_slab_with_two_distinct_z_levels():
+    """A deck's defining fact is the void it spans: measured, Granville as a
+    slab blocks only above 72.6 deg (a sun angle Vancouver never reaches),
+    while the same deck extruded from the waterline shades the channel all
+    day. So the model must produce a top and an underside — and NOTHING
+    between the underside and the water."""
+    from ducklidar import objects as O
+
+    P = _deck_points()
+    parts = O.bridge_deck_model(P[:, 0], P[:, 1], P[:, 2])
+    assert len(parts) == 1
+    soup, cols, kind = parts[0]
+    assert kind == O.SLAB, "a bridge deck is a slab, never a solid"
+    assert len(soup) == len(cols) and len(soup) % 3 == 0
+    zs = np.unique(np.round(soup[:, 2], 3))
+    assert len(zs) == 2, f"a slab is a (top, bottom) pair, got {zs}"
+    bot, top = float(zs[0]), float(zs[1])
+    assert top == 20.0, "the deck surface is the measured one"
+    assert bot > 15.0, "nothing reaches the waterline: the void stays open"
+    assert 0.6 <= top - bot <= 3.0, (top, bot)
+    # each level carries real area (a plate, not a wedge)
+    assert (soup[:, 2] > top - 1e-3).sum() > 100
+    assert (soup[:, 2] < bot + 1e-3).sum() > 100
+    # the thickness is MEASURED from the girder returns, not the lab default
+    assert abs((top - bot) - 1.35) < 0.15, top - bot
+    assert abs((top - bot) - O.DECK_T) > 1e-6
+
+
+def test_bridge_deck_falls_back_to_the_labs_measured_thickness():
+    """With no sub-deck evidence the lab's Granville measurement stands:
+    DECK_T = 1.6 m box-girder depth [2026-08-01]."""
+    from ducklidar import objects as O
+
+    rng = np.random.default_rng(1)
+    n = 3000
+    P = np.column_stack([rng.uniform(0, 30, n), rng.uniform(0, 10, n),
+                         np.full(n, 12.0)])
+    soup, _c, kind = O.bridge_deck_model(P[:, 0], P[:, 1], P[:, 2])[0]
+    assert kind == O.SLAB
+    assert abs(np.ptp(soup[:, 2]) - O.DECK_T) < 1e-3
+
+
+def test_bridge_support_is_a_solid_column_and_only_where_measured():
+    """Kaveh's ruling (2026-08-05): the support is NOT the bridge. It is an
+    object standing on ground or in water, opaque from footing to deck — and
+    it is claimed from returns, never spaced by rule."""
+    from ducklidar import objects as O
+
+    P = _deck_points(girder=False, piers=True)
+    piers = O.bridge_support_model(P[:, 0], P[:, 1], P[:, 2],
+                                   ground_z=0.0, deck_bottom=18.4)
+    assert len(piers) == 2, "one solid per measured pier"
+    for soup, cols, kind in piers:
+        assert kind == O.SOLID, "a pier stops light"
+        assert len(soup) == 36, "a closed box is 12 triangles"
+        assert abs(soup[:, 2].min()) < 1e-6 and abs(soup[:, 2].max() - 18.4) < 1e-6
+        assert len(cols) == len(soup)
+    # deck-only returns invent no piers
+    flat = P[P[:, 2] > 19.0]
+    assert O.bridge_support_model(flat[:, 0], flat[:, 1], flat[:, 2],
+                                  0.0, 18.4) == []
+
+
+def test_glass_is_a_zero_thickness_pane_on_its_own_plane():
+    """Glazing is a facet, not a volume: a curtain wall is a skin on a wall
+    that already exists as its own solid, and it transmits. The pane is built
+    in the plane the returns were measured in, so a vertical facade stays
+    vertical and has no depth."""
+    from ducklidar import objects as O
+
+    rng = np.random.default_rng(5)
+    n = 1500
+    # a 6 x 4 m window wall at x = 3, scattered +- 2 cm (glass is not perfect)
+    P = np.column_stack([3.0 + rng.normal(0, 0.02, n),
+                         rng.uniform(0, 6, n), rng.uniform(10, 14, n)])
+    parts = O.glass_model(P[:, 0], P[:, 1], P[:, 2])
+    assert len(parts) == 1
+    soup, cols, kind = parts[0]
+    assert kind == O.GLASS, "glass is neither solid nor slab: it transmits"
+    assert len(soup) % 6 == 0, "flat quads, two triangles each"
+    assert np.ptp(soup[:, 0]) < 0.25, "no thickness across the facet"
+    assert np.ptp(soup[:, 1]) > 4.0 and np.ptp(soup[:, 2]) > 3.0
+    assert (cols == O.WINCOL).all()
+    # a horizontal skylight goes through the SAME method, no special case
+    S = np.column_stack([rng.uniform(0, 4, 600), rng.uniform(0, 4, 600),
+                         20.0 + rng.normal(0, 0.02, 600)])
+    sky = O.glass_model(S[:, 0], S[:, 1], S[:, 2])[0]
+    assert sky[2] == O.GLASS and np.ptp(sky[0][:, 2]) < 0.25
+
+
+def test_small_is_its_own_extrusion_and_never_a_car():
+    """947 of 2,155 objects were drawn as cars AFTER looks_like_car said they
+    were not cars. A bin sits ON the pavement, has no cabin and no long axis:
+    the only honest model is its own measured top extruded to the ground."""
+    from ducklidar import objects as O
+
+    rng = np.random.default_rng(7)
+    n = 900
+    # a 2 m round bollard-ish blob, 1.4 m tall, standing at z = 5
+    a = rng.uniform(0, 2 * np.pi, n)
+    r = np.sqrt(rng.uniform(0, 1, n)) * 1.0
+    P = np.column_stack([50 + r * np.cos(a), 50 + r * np.sin(a),
+                         5.0 + rng.uniform(1.0, 1.4, n)])
+    soup, cols, kind = O.small_model(P[:, 0], P[:, 1], P[:, 2], 5.0)[0]
+    assert kind == O.SOLID
+    assert abs(soup[:, 2].min() - 5.0) < 0.01, "it stands ON the ground"
+    assert 6.0 < soup[:, 2].max() < 6.5
+    # the car model on the same points would leave a 0.25 m gap under it
+    car = O.car_model(P[:, 0], P[:, 1], P[:, 2])
+    assert car[0][0][:, 2].min() > soup[:, 2].min() + 0.2
+    assert len(cols) == len(soup)
+    # too low to be anything: no mesh, not a car
+    flat = P.copy()
+    flat[:, 2] = 5.0 + rng.uniform(0, 0.3, n)
+    assert O.small_model(flat[:, 0], flat[:, 1], flat[:, 2], 5.0) == []
+
+
+def test_on_bridge_keeps_its_own_datum_the_deck():
+    """`on_bridge` exists as a type precisely because these objects stand on a
+    deck, not on terrain — 425 instances of it. Its base is its own P2, and no
+    terrain grid is consulted."""
+    from ducklidar import objects as O
+
+    rng = np.random.default_rng(11)
+    n = 700
+    P = np.column_stack([rng.uniform(0, 1.2, n), rng.uniform(0, 1.2, n),
+                         20.0 + rng.uniform(0, 1.1, n)])
+    soup, _c, kind = O.on_bridge_model(P[:, 0], P[:, 1], P[:, 2])[0]
+    assert kind == O.SOLID
+    assert 19.5 < soup[:, 2].min() < 20.0, "based on the deck it stands on"
+    assert soup[:, 2].max() > 20.9
+
+
+def test_every_type_model_reports_its_own_kind():
+    """The contract: one named method per taxonomy type, each returning
+    (soup, cols, kind). Nothing borrows, and the kind is not the caller's to
+    decide."""
+    pytest.importorskip("mapbox_earcut")
+    from ducklidar import objects as O
+
+    rng = np.random.default_rng(13)
+    ring = np.array([[0.0, 0.0], [8.0, 0.0], [8.0, 6.0], [0.0, 6.0]])
+    n = 800
+    blob = np.column_stack([rng.uniform(0, 6, n), rng.uniform(0, 3, n),
+                            rng.uniform(0.2, 3.0, n)])
+    cases = {
+        "building": O.building_model(ring, 0.0, 9.0),
+        "moorage": O.moorage_model(ring, 0.0, 5.0),
+        "water": O.water_model([ring], 1.25),
+        "terrain": O.terrain_model([ring], np.arange(4) * 0.1),
+        "boat": O.boat_model(blob[:, 0], blob[:, 1], blob[:, 2] + 1.0, 0.0),
+        "lowveg": O.lowveg_model(blob[:, 0], blob[:, 1], blob[:, 2]),
+        "tree": O.tree_model(blob[:, 0], blob[:, 1], blob[:, 2] * 4, 0.0),
+        "lamp": O.lamp_model(np.zeros(50), np.zeros(50),
+                             np.linspace(0.2, 6.0, 50), 0.0),
+    }
+    # a type may ship SEVERAL kinds when its parts differ physically: a tree
+    # is an opaque trunk under a porous crown, so `solid` + `slab`
+    # [2026-08-05]. The rule is that every part states a kind the sun
+    # understands, and one this type is allowed to use.
+    want = {"building": {O.SOLID}, "moorage": {O.SOLID}, "water": {O.SURFACE},
+            "terrain": {O.SURFACE}, "boat": {O.SOLID}, "lowveg": {O.SLAB},
+            "tree": {O.SOLID, O.SLAB}, "lamp": {O.SOLID}}
+    for name, parts in cases.items():
+        assert parts, f"{name}_model produced nothing"
+        for soup, cols, kind in parts:
+            assert kind in want[name], (name, kind)
+            assert len(soup) == len(cols) and len(soup) % 3 == 0
+            assert soup.dtype == np.float32 and cols.dtype == np.uint8
+    # water and terrain are the same drape at different heights; both surfaces
+    assert {p[2] for p in cases["water"]} == {O.SURFACE}
+
+
+def test_boat_model_never_returns_dock_geometry():
+    """`boat_mesh` silently redirects a low float to `dock_mesh` while keeping
+    the boat label, so the export's boat/dock split did not mean what it said.
+    A barge is a LOW HULL; which one it is was already decided by the map
+    partition before the model was called."""
+    from ducklidar import objects as O
+
+    rng = np.random.default_rng(17)
+    n = 1200
+    # a 10 x 3 m barge standing 0.8 m over the water: under boat_mesh's 1.2 m
+    P = np.column_stack([rng.uniform(0, 10, n), rng.uniform(0, 3, n),
+                         rng.uniform(0.2, 0.8, n)])
+    hull = O.boat_model(P[:, 0], P[:, 1], P[:, 2], 0.0)
+    assert hull and hull[0][2] == O.SOLID
+    # the hull tapers to a bow: the widest and narrowest stations differ
+    soup = hull[0][0]
+    assert len(soup) > 60, "a hull, not a traced slab"
+    assert O.boat_mesh(P[:, 0], P[:, 1], P[:, 2], 0.0, [1, 2, 3]) is not hull
+
+
+def test_cell_prism_is_shared_by_the_solid_and_the_slab():
+    """The one primitive both a grounded solid and a floating plate are made
+    of — the only difference is where the bottom sits. Types share PRIMITIVES,
+    never each other's recipes."""
+    from ducklidar import objects as O
+
+    top = np.full((4, 4), 10.0)
+    occ = np.zeros((4, 4), bool)
+    occ[1:3, 1:3] = True
+    grounded = O.cell_prism(top, 0.0, occ, np.array([0.0, 0.0]), 1.0)
+    plate = O.cell_prism(top, top - 1.6, occ, np.array([0.0, 0.0]), 1.0)
+    assert len(grounded) == len(plate), "same cells, same triangles"
+    assert grounded[:, 2].min() == 0.0 and plate[:, 2].min() == 8.4
+    assert grounded[:, 2].max() == plate[:, 2].max() == 10.0

@@ -40,9 +40,15 @@ SORT_CELL_M = 50.0
 ROW_GROUP = 500_000
 
 
-def box(cx, cy, half):
-    """`(minx, miny, maxx, maxy)` for a square window — the shape every function here takes."""
-    return (cx - half, cy - half, cx + half, cy + half)
+def box(cx, cy, half, half_y=None):
+    """`(minx, miny, maxx, maxy)` for a window — the shape every function here takes.
+
+    Square by default; pass `half_y` for a rectangle. Surveys are cut into squares,
+    study areas rarely are, and a square forced over a thin slice reads data the
+    question never asked for.
+    """
+    hy = half if half_y is None else half_y
+    return (cx - half, cy - hy, cx + half, cy + hy)
 
 
 def _opener(src):
@@ -116,6 +122,11 @@ def to_parquet(src, dest=None, *, fields=EXTRAS, chunk=2_000_000, overwrite=Fals
     order = np.argsort(key, kind="stable")
     del key
 
+    # pid: the point's row in this file, assigned after the sort so it is stable for
+    # the life of the sidecar. It is the join key that lets derived tables (features,
+    # edges, labels, components) live outside this file and still mean "that point".
+    cols["pid"] = np.argsort(order, kind="stable")     # inverse permutation of the sort
+
     schema = pa.schema([(k, pa.from_numpy_dtype(v.dtype)) for k, v in cols.items()])
     tmp = dest.with_suffix(dest.suffix + ".part")
     with pq.ParquetWriter(tmp, schema, compression="zstd") as w:
@@ -134,13 +145,29 @@ def read(src, bbox, *, fields=EXTRAS, drop_noise=True, parquet=True):
     and every fetched cache line is useful. Measured against the alternatives on 1 M points,
     same query: columnar 1.5 ms / 26 MB, numpy structured array 3.3 ms / 26 MB — identical
     memory, and the gap is cache locality alone — Python rows 32 ms / 343 MB.
+
+    `src` may also be a **sequence of tiles** — the window is answered across all of them,
+    so a box near a tile border gets the neighbouring tile's points too instead of a
+    one-sided neighbourhood (surveys are cut into squares; the world is not). Tiles that
+    do not touch `bbox` are skipped from their header or row-group statistics alone, so
+    passing every tile you have is cheap. A `.parquet` path is accepted directly, for
+    sidecars that cannot live next to their source file.
     """
     import laspy
+
+    if isinstance(src, (list, tuple)):
+        parts = [read(s, bbox, fields=fields, drop_noise=drop_noise, parquet=parquet)
+                 for s in src]
+        full = [p for p in parts if len(p["x"])]
+        if not full:
+            return parts[0]
+        keys = [k for k in full[0] if all(k in p for p in full)]
+        return {k: np.concatenate([p[k] for p in full]) for k in keys}
 
     src = str(src)
     want = ["x", "y", "z", "classification", *fields]
 
-    cache = parquet_path(src)
+    cache = pathlib.Path(src) if src.lower().endswith(".parquet") else parquet_path(src)
     if parquet and not src.startswith("http") and cache.exists():
         import pyarrow.parquet as pq
 
@@ -163,11 +190,15 @@ def read(src, bbox, *, fields=EXTRAS, drop_noise=True, parquet=True):
 
     parts = []
     with _opener(src)() as fh:
-        for ch in fh.chunk_iterator(2_000_000):
-            d = _columns(ch, fields)
-            keep = _inside(d, bbox, drop_noise)
-            if keep.any():
-                parts.append({k: v[keep] for k, v in d.items()})
+        h = fh.header
+        overlaps = (h.mins[0] <= bbox[2] and h.maxs[0] >= bbox[0]
+                    and h.mins[1] <= bbox[3] and h.maxs[1] >= bbox[1])
+        if overlaps:
+            for ch in fh.chunk_iterator(2_000_000):
+                d = _columns(ch, fields)
+                keep = _inside(d, bbox, drop_noise)
+                if keep.any():
+                    parts.append({k: v[keep] for k, v in d.items()})
     if not parts:
         with _opener(src)() as fh:
             empty = _columns(next(fh.chunk_iterator(1)), fields)
