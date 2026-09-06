@@ -537,7 +537,9 @@ was decided, not a pseudo-probability; the gate compares labels only,
 provenance is reported. Nothing to optimize.
 
 **Output:** THE contract file `data/stage5/labels.parquet` —
-`pid i64, label i8 (0..9), settled i8 (0..3)`.
+`pid i64, label i8 (0..9), label_rules i8 (0..9), settled i8 (0..3)` —
+`label_rules` is the decision as the rules made it, `label` is after the
+map step (5.10 and the per-type map claims).
 
 ## The gate
 
@@ -545,3 +547,12 @@ Whatever implements 5a+5b must reproduce the lab reference labels
 (42.7 M points) ≥ 99.5 % by pid/coordinate join. Measured precedent: the
 lifted rules on store reads scored 99.79 %; the residual was quantified
 (kNN tie-breaking), not waved through.
+
+**What is compared is `label_rules`, not the final `label`.** The map step
+that runs after the decision — one claim method per Overture-mapped type and
+the building veto (Kaveh, 2026-08-05: a building must have a footprint) — is
+a deliberate departure from the lab's rules, and the reference was labelled
+before that rule existed. Gating the final label measured that departure as
+a failure: 97.65 % on 2026-09-05, of which 811,894 points were the veto
+alone (building → small). The gate now reports the map step's movement
+separately, as intended change, and passes or fails on the decision.
