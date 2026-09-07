@@ -104,10 +104,57 @@ themselves — frame 0.145 m, mullion 0.155 m, sill 0.065 m proud 0.075 m,
 glass 0.035 m behind. A wall no photo sees properly gets the building's
 material and **nothing invented** — which, on a real block, is most walls.
 
+## One textured building, one call
+
+`dl.building3d` composes all of the above: the building's own returns, a
+solid, every photo's real pose, the walls, the roof, and the GLB.
+
+```python
+import ducklidar as dl
+
+b = dl.building3d(ring, store="data/lidar/*.parquet", photos="out/photos",
+                  out="out/netloft", level="joinery")
+b.glb        # Path — out/netloft/building.glb, next to viewer.html
+b.walls      # [{id, w, h, facing, photos, filled, elements, …}, …]
+b.elements   # {wall id: [{type, x0, y0, x1, y1, conf, …}, …]}  metres on the wall
+b.qa         # Path — the per-wall QA sheet
+b.meta       # origin, CRS, level, prims, coverage
+```
+
+`level` buys skin, not geometry — `"none"` is the solid alone, `"material"`
+one measured wall colour (no GPU, no photo API, and often enough for a
+shadow study), `"photo"` the composed texture, `"joinery"` that plus frames,
+sills, mullions and glass as real geometry.
+
+**A build never calls an API.** `photos`, `masks` and `elements` are folders
+a tool wrote; without them a wall gets the building's material and nothing
+invented. `solid=` takes a roofer LoD2.2 CityJSON if you have one — without
+one the geometry falls back to the surveyed outline extruded to the measured
+top with the returns' own roof planes on it, so roofer is never required.
+Labels are optional too: with none, the ground is the low tail of z inside
+the footprint and the building is what stands above it.
+
+## Tools
+
+Things you *run*, never things a build imports — each spends something a
+library must not spend by itself: an API quota, a GPU, or another program's
+licence.
+
+```bash
+python -m ducklidar.tools.fetch_streetview --points b.npz --out out/photos
+python -m ducklidar.tools.segment          --photos out/photos     # SAM 3, both passes, one image load
+python -m ducklidar.tools.roofer --points box.laz --footprints b.gpkg --out out/roofer --bin ./roofer
+```
+
+`roofer` is GPL-3 and is run as a **subprocess, never linked** and never
+installed as a dependency; its module docstring carries the glibc shim the
+2.35 hosts need. `segment` needs `transformers` + a GPU (`pip install
+ducklidar[sam]`), `fetch_streetview` a Street View key of your own.
+
 Extras: `facade` (scikit-image, shapely). The masks come from any segmenter
-that labels occluders, buildings and facade elements; the pilot uses SAM 3.
-Composing the whole thing into one call — an OSM way id in, a model out —
-is [docs/design/building3d.md](docs/design/building3d.md).
+that labels occluders, buildings and facade elements; the tool uses SAM 3.
+The design behind the one call is
+[docs/design/building3d.md](docs/design/building3d.md).
 
 ## Documentation
 
@@ -133,6 +180,10 @@ is [docs/design/building3d.md](docs/design/building3d.md).
 - [The labeling rules](docs/rules-operators.md) — the measured rules
   (lifted verbatim into `ducklidar.rules`) and the worksheet for their
   table-shaped redesign.
+- [The photo manifest](docs/photo-manifest.md) — bring your own photos:
+  what a folder of images must say about itself so `building3d` can use it.
+- [Where the data lives](docs/data-layout.md) — one folder per building:
+  the conventional layout and naming for tiles, footprints, photos and outputs.
 - [API reference](docs/api.md) — every public function, grouped, with
   signatures.
 
