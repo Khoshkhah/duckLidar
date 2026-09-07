@@ -87,7 +87,17 @@ without `elements/` it caps at `"photo"`.
 
 ## Many buildings
 
-Walk the folder. The id is the folder name, and everything else follows from
+Every footprint of an extract that lies wholly inside a tile, in one command —
+it writes `buildings/<id>/footprint.json` and `out/<id>/` for each, keeps any
+`out/<id>/building.glb` that already exists, and uses `buildings/<id>/photos`
+when present:
+
+```bash
+python -m ducklidar.tools.build_tile --tile tiles/490000_5457000.parquet \
+    --footprints footprints/granville_island.duckdb --root .
+```
+
+Or walk the folder yourself. The id is the folder name, and everything else follows from
 it:
 
 ```python

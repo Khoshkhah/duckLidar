@@ -24,6 +24,12 @@ import numpy as np
 EAVE = 3.0        # m: a roof overhangs its walls, so the footprint is grown by this to catch the eave returns
 MIN_H = 1.0       # m: without labels, a return this far above local ground is the building, not its forecourt
 GROUND_PCT = 2.0  # the ground under a building is the low tail of z inside the footprint, not its minimum (outliers)
+MIN_CLASSIFIED = 50  # class-6 returns inside the footprint before the survey's own labels are trusted
+COVER = 0.25      # of the footprint's 1 m cells: a layer covering less is not this building's roof
+COVER_TAIL = 0.02 # ...but what stands on the covering layer stays while it covers this much...
+TAIL_M = 6.0      # ...and ENDS within this: a plant room does, a bridge pier through the roof does not
+BAND_BIN = 0.5    # m: the z histogram bin the roof layer is found in
+BAND_FRAC = 0.05  # a bin holding less than this share of the roof's own peak is no longer the building
 
 
 def footprint_ring(source, bid=None, osm_id=None):
@@ -58,8 +64,78 @@ def as_ring(fp):
     return a
 
 
+def roof_band(z, z_ground, min_h=MIN_H, bin_m=BAND_BIN, frac=BAND_FRAC):
+    """(lo, hi) in z: the building's own layer of SINGLE returns above the ground.
+
+    `z` is the single (number_of_returns == 1) returns inside the footprint. A roof stops a
+    pulse dead, so it is a dense band in the histogram of these; a crown or a bridge deck
+    above it is porous (multi-return) or separated by nearly empty bins. The band is the
+    lowest bin at `frac` of the strongest and every contiguous bin above it still at `frac`.
+
+    [measured] Granville Island, 2026-09-06, 175 footprints with an Overture height, model
+    top = P98 of the kept returns: the raw P98 of everything inside the collar was a median
+    1.56x the Overture height and 90 of 175 were over 1.5x (the Granville Bridge deck gave one
+    building 115 m; a crown gave a 5 m shop 33 m). Splitting on single returns alone: the
+    tree-covered shop's singles are 2719 / 2856 per 2 m in the roof and under 150 above it,
+    against 200-500 per bin of multi-returns all the way up.
+    """
+    lo = z_ground + min_h
+    zz = z[z >= lo]
+    if len(zz) < 20: return lo, np.inf
+    edges = np.arange(lo, zz.max() + bin_m, bin_m); cnt, _ = np.histogram(zz, edges)
+    strong = cnt >= frac * cnt.max()
+    top = first = int(np.argmax(strong))
+    while top + 1 < len(cnt) and strong[top + 1]: top += 1
+    return lo, float(edges[top + 1])
+
+
+def coverage(x, y, z, ncell, z_ground, edges):
+    """Per height bin, the share of the footprint's `ncell` 1 m cells holding one of these returns."""
+    zz = z - z_ground
+    cx, cy = np.floor(x).astype(np.int64), np.floor(y).astype(np.int64)
+    cov = np.zeros(len(edges) - 1)
+    for i in range(len(cov)):
+        s = (zz >= edges[i]) & (zz < edges[i + 1])
+        cov[i] = len(np.unique(cx[s] * 1_000_003 + cy[s])) / ncell
+    return cov
+
+
+def roof_top(x, y, z, ncell, z_ground, x1=None, y1=None, z1=None, cover=COVER, tail=COVER_TAIL, tail_m=TAIL_M, bin_m=2.0):
+    """The z above which the survey's building returns no longer cover this footprint.
+
+    `x, y, z` are the returns the survey classed as BUILDING; `x1, y1, z1` those it left
+    UNCLASSIFIED (optional). Per `bin_m` of height, the share of the footprint's 1 m cells that
+    hold a return. A roof covers the footprint; a bridge pier passing through it, or a tower's
+    wall column, covers a few percent. The top is the highest bin of building returns at
+    `cover` (or the highest holding any, when none covers that much), plus what stands ON it
+    — the bins above, building or unclassified, still at `tail` — provided that ends within
+    `tail_m`: a plant room or a parapet does, a pier does not.
+
+    [measured] Granville Island 2022, coverage per 2 m: a shop's class-6 roof 64 %, the
+    Granville Bridge pier through it 5-8 % for 100 m, the deck 22 %; a podium roof 33 %, the
+    tower shaft above 4-7 %, the tower's top 19 %; a tower filling its footprint 83 %. So a
+    quarter separates the deck from every roof. gers_003362c0's plant room is class 1, 9 % of
+    the cells and 4 m above its class-6 tower top; the bridge deck over gers_0b9fca8a is class
+    1 too, 60 % of the cells, 20 m of empty air above a 12 m class-6 roof — which is why the
+    unclassified returns may only extend a roof, never be one.
+    """
+    zz = z - z_ground
+    if len(zz) < 2 or ncell == 0: return np.inf
+    zmax = max(zz.max(), (z1 - z_ground).max() if z1 is not None and len(z1) else 0.0)
+    edges = np.arange(0.0, zmax + bin_m, bin_m)
+    cov = coverage(x, y, z, ncell, z_ground, edges)
+    hit = np.nonzero(cov >= cover)[0]
+    top = int(hit[-1] if len(hit) else np.nonzero(cov > 0)[0][-1])
+    if x1 is not None and len(z1):
+        cov = np.maximum(cov, coverage(x1, y1, z1, ncell, z_ground, edges))
+    end = top
+    while end + 1 < len(cov) and cov[end + 1] >= tail: end += 1
+    if (end - top) * bin_m <= tail_m: top = end                # a tail that ends is the roof's own
+    return z_ground + float(edges[top + 1])
+
+
 def building_points(footprint, store, *, eave=EAVE, labels=None, keep_classes=(3, 9),
-                    min_h=MIN_H, fields=("red", "green", "blue")):
+                    min_h=MIN_H, fields=("red", "green", "blue", "number_of_returns")):
     """The returns that are this building, inside `footprint` grown by `eave`.
 
     `store` is anything `dl.read` takes — a parquet path, a LAS/LAZ file, or a list of tiles.
@@ -94,9 +170,26 @@ def building_points(footprint, store, *, eave=EAVE, labels=None, keep_classes=(3
         g = inside & (label == 0)
         z_ground = float(np.median(z[g])) if g.sum() > 50 else float(np.percentile(z[inside], GROUND_PCT))
     else:
-        z_ground = float(np.percentile(z[inside], GROUND_PCT)) if inside.any() else 0.0
+        from ..fields import BUILDING, GROUND
+        UNCLASSIFIED = 1
         label = np.full(len(x), -1, np.int16)
-        keep = inside & (z > z_ground + min_h)
+        core = shapely.contains_xy(poly, x, y)
+        cls = np.asarray(pts["classification"]) if "classification" in pts else np.zeros(len(x), np.uint8)
+        # UNCLASSIFIED counts as building inside the footprint: the survey left gers_003362c0's rooftop
+        # plant room as class 1 and its roof came out with a hole. What is not building (a crane cable)
+        # is cut where the coverage stops.
+        bld, g = np.isin(cls, (BUILDING, UNCLASSIFIED)), (cls == GROUND) & inside
+        z_ground = (float(np.median(z[g])) if g.sum() >= MIN_CLASSIFIED
+                    else float(np.percentile(z[inside], GROUND_PCT)) if inside.any() else 0.0)
+        if (core & (cls == BUILDING)).sum() >= MIN_CLASSIFIED:  # the survey says which returns are building
+            ncell = len(np.unique(np.floor(x[core]).astype(np.int64) * 1_000_003 + np.floor(y[core]).astype(np.int64)))
+            m6, m1 = core & (cls == BUILDING), core & (cls == UNCLASSIFIED)
+            hi = roof_top(x[m6], y[m6], z[m6], ncell, z_ground, x[m1], y[m1], z[m1])
+            keep = inside & bld & (z > z_ground + min_h) & (z <= hi)   # class 6 at ground level (a wall's foot, a fence) is not the roof
+        else:                                                    # it does not: the roof is a layer of single returns
+            single = np.asarray(pts["number_of_returns"]) == 1 if "number_of_returns" in pts else np.ones(len(x), bool)
+            lo, hi = roof_band(z[core & single], z_ground, min_h)
+            keep = inside & (z > lo) & (z < hi)
 
     return dict(x=x[keep], y=y[keep], z=z[keep], rgb=rgb[keep], label=label[keep],
                 ring=ring, z_ground=z_ground)

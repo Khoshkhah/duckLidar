@@ -9,6 +9,9 @@ writes. Run it once per building, yourself, with your own key:
 Metadata probes on rings 12/30/50 m outside the footprint find every panorama within 20 m
 of a probe; panoramas *inside* the footprint (indoor photospheres) are skipped; one
 640x640, fov 90, pitch 8 view per panorama is fetched, aimed at the nearest footprint edge.
+With `--footprints` (a duckOverture extract) a panorama whose line of sight to that edge
+crosses ANOTHER footprint is not bought either: on Granville Island that was a third of
+all photos (2149 of 6525, 2026-09-06), each showing the neighbour instead of the building.
 
 The key comes from `--key`, else `$GOOGLE_STREETVIEW_KEY`, else a `GOOGLE_STREETVIEW_KEY=`
 line in the `--env` file. Check Google's terms for your use — the pilot's use was
@@ -74,11 +77,39 @@ def discover(poly, key, rings=RINGS, crs=26910):
     return panos
 
 
-def fetch(poly, panos, out, key, limit=LIMIT, max_dist=MAX_DIST):
+def neighbours(db, poly, margin=MAX_DIST, crs=26910):
+    """Every other footprint within `margin` of `poly`, from a duckOverture extract."""
+    import duckdb
+    from shapely.geometry import Polygon
+    x0, y0, x1, y1 = poly.buffer(margin).bounds
+    con = duckdb.connect(str(db), read_only=True)
+    try:
+        con.execute("LOAD spatial")
+        rows = con.execute(
+            "select ST_AsGeoJSON(g) from (select ST_Transform(geometry, 'EPSG:4326', ?, always_xy := true) g"
+            " from buildings.building) where ST_Intersects(g, ST_MakeEnvelope(?, ?, ?, ?))",
+            [f"EPSG:{crs}", x0, y0, x1, y1]).fetchall()
+    finally:
+        con.close()
+    out = [Polygon(json.loads(gj)["coordinates"][0]) for gj, in rows]
+    return [q for q in out if not q.equals(poly) and q.intersection(poly).area < 0.5 * q.area]
+
+
+def blocked(poly, pano, others, min_len=1.0):
+    """Does another footprint stand between this panorama and the edge it would be aimed at?"""
+    from shapely.geometry import LineString, Point
+    cam = Point(pano["x"], pano["y"])
+    near = poly.exterior.interpolate(poly.exterior.project(cam))
+    los = LineString([cam, near]).difference(poly.buffer(0.5))
+    return any(q.intersection(los).length > min_len for q in others)
+
+
+def fetch(poly, panos, out, key, limit=LIMIT, max_dist=MAX_DIST, others=()):
     """One view per outside panorama, aimed at the nearest footprint edge. THIS is the billable part."""
     from shapely.geometry import Point
     sv = Path(out) / "streetview"; sv.mkdir(parents=True, exist_ok=True)
-    outside = sorted((p for p in panos.values() if not p["inside"] and p["dist_m"] <= max_dist),
+    outside = sorted((p for p in panos.values() if not p["inside"] and p["dist_m"] <= max_dist
+                      and not blocked(poly, p, others)),
                      key=lambda p: p["dist_m"])
     for p in outside[:limit]:
         near = poly.exterior.interpolate(poly.exterior.project(Point(p["x"], p["y"])))
@@ -140,6 +171,7 @@ def main(argv=None):
     ap.add_argument("--env", help="file holding a GOOGLE_STREETVIEW_KEY= line")
     ap.add_argument("--crs", type=int, default=26910, help="EPSG of the ring (default 26910, UTM 10N)")
     ap.add_argument("--limit", type=int, default=LIMIT, help=f"images to fetch (default {LIMIT})")
+    ap.add_argument("--footprints", help="duckOverture extract: skip panoramas another footprint blocks")
     ap.add_argument("--probe-only", action="store_true", help="metadata only — free, fetches nothing")
     a = ap.parse_args(argv)
     if not (a.points or a.ring): ap.error("need --points or --ring")
@@ -150,7 +182,8 @@ def main(argv=None):
     print(f"{len(panos)} panoramas; dates {sorted(Counter(p['date'] for p in panos.values()).items())}")
     if a.probe_only:
         json.dump(list(panos.values()), open(Path(a.out) / "panos.json", "w"), indent=1); return 0
-    imgs = fetch(poly, panos, a.out, key, limit=a.limit)
+    others = neighbours(a.footprints, poly, crs=a.crs) if a.footprints else ()
+    imgs = fetch(poly, panos, a.out, key, limit=a.limit, others=others)
     print(f"fetched {len(imgs)} -> {Path(a.out)/'streetview'}")
     sheet_and_map(poly, panos, imgs, a.out)
     return 0

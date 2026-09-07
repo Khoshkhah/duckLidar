@@ -129,10 +129,14 @@ sills, mullions and glass as real geometry.
 **A build never calls an API.** `photos`, `masks` and `elements` are folders
 a tool wrote; without them a wall gets the building's material and nothing
 invented. `solid=` takes a roofer LoD2.2 CityJSON if you have one — without
-one the geometry falls back to the surveyed outline extruded to the measured
-top with the returns' own roof planes on it, so roofer is never required.
-Labels are optional too: with none, the ground is the low tail of z inside
-the footprint and the building is what stands above it.
+one the geometry falls back to the surveyed outline, each edge raised to the
+roof height measured along it, every roof tier standing above that (a tower
+on a podium, a plant room on the tower) traced from the returns and given its
+own walls, and the returns' own roof planes on top — so roofer is never required.
+Labels are optional too: with none, the survey's own building class decides
+which returns are the building, cut where they stop covering the footprint
+(a bridge deck over a shop is not its roof); a survey without classes falls
+back to the layer of single returns above the ground, which a crown is not.
 
 ## Tools
 
@@ -144,7 +148,14 @@ licence.
 python -m ducklidar.tools.fetch_streetview --points b.npz --out out/photos
 python -m ducklidar.tools.segment          --photos out/photos     # SAM 3, both passes, one image load
 python -m ducklidar.tools.roofer --points box.laz --footprints b.gpkg --out out/roofer --bin ./roofer
+python -m ducklidar.tools.build_tile --tile tiles/490000_5457000.parquet --footprints footprints/granville_island.duckdb --root .
 ```
+
+`build_tile` is the whole tile in one go: every footprint of a duckOverture
+extract that lies wholly inside the tile becomes `out/gers_<id>/building.glb`
+(geometry and measured material; with photos where `buildings/<id>/photos`
+exists). Measured on Granville Island: 246 buildings in 17 s. Footprints the
+tile edge cuts are skipped and counted, not built with half their returns.
 
 `roofer` is GPL-3 and is run as a **subprocess, never linked** and never
 installed as a dependency; its module docstring carries the glibc shim the

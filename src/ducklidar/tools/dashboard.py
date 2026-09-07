@@ -45,7 +45,7 @@ def collect(root, only=(), max_points=MAX_POINTS, log=print):
         if not glb.is_file() or (only and d.name not in only): continue
         meta = json.loads((d / "meta.json").read_text()) if (d / "meta.json").is_file() else {}
         ox, oy, oz = meta.get("origin_utm", (0, 0, 0))
-        b = dict(id=d.name, name=meta.get("name", d.name), level=meta.get("level", "?"),
+        b = dict(id=d.name, name=meta.get("name", d.name), level=meta.get("level", "?"), built=meta.get("built", ""),
                  glb=base64.b64encode(glb.read_bytes()).decode(), photos=[], points=None, npts=0,
                  walls=[dict(id=f["id"], w=f["w"], h=f["h"], facing=f["facing"], method=f.get("method", ""),
                              filled=f.get("filled", 0), elements=len(f.get("elements", [])))
@@ -70,7 +70,7 @@ def collect(root, only=(), max_points=MAX_POINTS, log=print):
                 # a fetcher may write paths relative to its own cwd or to the manifest — try both
                 if not f.is_absolute():
                     f = next((c for c in (mf.parent / f, root / f, Path.cwd() / f) if c.is_file()), mf.parent / f)
-                if not f.is_file(): continue
+                if not f.is_file() or p.get("unused"): continue      # the build skipped it; so does the page
                 b["photos"].append(dict(i=i, src=thumb(f), date=p.get("date", ""), dist=p.get("dist_m", ""),
                                         heading=p.get("heading", 0), unused=p.get("unused", ""),
                                         x=round(p.get("x", ox) - ox, 2), y=round(-(p.get("y", oy) - oy), 2)))
@@ -91,7 +91,8 @@ def three_js():
 
 def page(buildings):
     return (TEMPLATE.replace("%THREE%", three_js())
-            .replace("%DATA%", json.dumps(buildings)).replace("%N%", str(len(buildings))))
+            .replace("%DATA%", json.dumps(buildings)).replace("%N%", str(len(buildings)))
+            .replace("%GEN%", __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M")))
 
 
 TEMPLATE = r"""<!doctype html><html><head><meta charset="utf-8"><title>ducklidar — buildings</title>
@@ -101,6 +102,8 @@ html,body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-u
 header{padding:14px 20px 10px;display:flex;gap:14px;align-items:baseline;flex-wrap:wrap}
 header h1{margin:0;font-size:17px}header span{color:var(--muted)}
 select{font:14px system-ui;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:#fff}
+#bid{font:13px ui-monospace,monospace;margin-left:10px;padding:3px 8px;border:1px solid var(--line);border-radius:6px;background:#fff;cursor:copy;user-select:all}
+#prev,#next{font:14px system-ui;margin-left:4px;padding:2px 8px;border:1px solid var(--line);border-radius:6px;background:#fff;cursor:pointer}
 .grid{display:grid;grid-template-columns:1fr 1fr;gap:12px;padding:0 20px}
 .card{background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden}
 .card h2{margin:0;padding:9px 14px;font-size:13px;border-bottom:1px solid var(--line);font-weight:600}
@@ -119,8 +122,8 @@ td,th{padding:3px 10px 3px 0;text-align:left}th{color:var(--muted);font-weight:5
 label{font-size:12px;color:var(--muted);margin-left:12px}
 .note{color:var(--muted);padding:20px;font-size:13px}
 </style></head><body>
-<header><h1>ducklidar — buildings</h1>
-<select id="pick"></select><span id="sub"></span></header>
+<header><h1>ducklidar — buildings <small id="gen"></small></h1>
+<select id="pick"></select><code id="bid" title="click to copy the id"></code><button id="prev" title="previous">&lsaquo;</button><button id="next" title="next">&rsaquo;</button><span id="sub"></span></header>
 <div class="grid">
  <div class="card"><h2>LiDAR returns<span id="ptsinfo"></span></h2><canvas id="cpts"></canvas></div>
  <div class="card"><h2>3-D model<span id="mdlinfo"></span>
@@ -134,6 +137,7 @@ label{font-size:12px;color:var(--muted);margin-left:12px}
 <script>%THREE%</script>
 <script>
 const B = %DATA%;
+const GEN = "%GEN%";
 const bin = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
 function view(canvas){
   const r = new THREE.WebGLRenderer({canvas, antialias:true}); r.setPixelRatio(devicePixelRatio); r.outputEncoding = THREE.sRGBEncoding;
@@ -159,7 +163,9 @@ function view(canvas){
 const P = view(document.getElementById("cpts")), M = view(document.getElementById("cmodel"));
 let model = null, camGroup = null, marks = {};
 function show(b){
-  document.getElementById("sub").textContent = `${b.level} · ${b.walls.length} walls · ${b.photos.length} photos`;
+  const bid = document.getElementById("bid"); bid.textContent = b.id;
+  bid.onclick = () => { navigator.clipboard?.writeText(b.id); bid.style.background = "#dff5e1"; setTimeout(() => bid.style.background = "#fff", 400); };
+  document.getElementById("sub").textContent = `${b.level} · ${b.walls.length} walls · ${b.photos.length} photos · built ${b.built || "?"}`;
   // points
   P.clear();
   document.getElementById("ptsinfo").textContent = b.points
@@ -209,6 +215,9 @@ document.getElementById("cams").onchange = e => { if (camGroup) camGroup.visible
 const pick = document.getElementById("pick");
 B.forEach((b, i) => { const o = document.createElement("option"); o.value = i; o.textContent = `${b.name}  (${b.level})`; pick.appendChild(o); });
 pick.onchange = () => show(B[+pick.value]);
+document.getElementById("gen").textContent = "page written " + GEN;
+document.getElementById("prev").onclick = () => { pick.value = Math.max(0, +pick.value - 1); show(B[+pick.value]); };
+document.getElementById("next").onclick = () => { pick.value = Math.min(B.length - 1, +pick.value + 1); show(B[+pick.value]); };
 if (B.length) show(B[0]); else document.body.insertAdjacentHTML("beforeend", '<div class="note">no buildings found under out/</div>');
 </script></body></html>"""
 

@@ -82,3 +82,85 @@ def test_facades_of_the_fallback_solid_are_usable_walls():
 def test_level_is_validated():
     with pytest.raises(ValueError, match="level"):
         b3d.building3d(np.zeros((4, 2)), points=dict(), level="lots")
+
+
+def _store(tmp_path, classified=True):
+    """A shed (roof z=6 over 0..12 x 0..8) on ground z=2, a crown 8..15 m over half of it, a pier column
+    and a deck at z=30 over a fifth of it — everything a footprint window catches that is not the shed."""
+    import pyarrow as pa
+    import pyarrow.parquet as pq
+    rng = np.random.default_rng(1)
+    def cloud(n, x0, x1, y0, y1, z0, z1, cls, nr):
+        return (rng.uniform(x0, x1, n), rng.uniform(y0, y1, n), rng.uniform(z0, z1, n),
+                np.full(n, cls, np.uint8), np.full(n, nr, np.uint8))
+    parts = [cloud(6000, -8, 20, -8, 16, 1.9, 2.1, 2, 1),        # ground, single returns
+             cloud(6000, 0, 12, 0, 8, 5.9, 6.1, 6, 1),           # the roof
+             cloud(3000, 6, 12, 0, 8, 8, 15, 5, 3),              # a crown over the east half, multi-return
+             cloud(800, 5, 6, 4, 5, 6, 30, 6, 1),                # a pier through it, classed as building
+             cloud(1500, 0, 12, 0, 1.0, 29.9, 30.1, 6, 1)]       # the deck: an eighth of the footprint
+    x, y, z, c, nr = (np.concatenate(k) for k in zip(*parts))
+    if not classified: c = np.ones_like(c)
+    tb = pa.table(dict(x=x, y=y, z=z, classification=c, number_of_returns=nr, pid=np.arange(len(x)),
+                       red=np.zeros(len(x), np.uint16), green=np.zeros(len(x), np.uint16), blue=np.zeros(len(x), np.uint16)))
+    p = tmp_path / "t.parquet"; pq.write_table(tb, p); return p
+
+
+@pytest.mark.parametrize("classified", [True, False])
+def test_building_points_keeps_the_shed_not_the_crown_pier_or_deck(tmp_path, classified):
+    """With the survey's classes: the roof's coverage ends the building below the pier and the deck.
+    Without: the roof is the layer of single returns; the crown is multi-return and above it."""
+    ring = [[0.0, 0.0], [12.0, 0.0], [12.0, 8.0], [0.0, 8.0]]
+    d = bpts.building_points(ring, _store(tmp_path, classified))
+    assert 1.9 < d["z_ground"] < 2.1
+    assert 5.8 < np.percentile(d["z"], 98) < 6.6, np.percentile(d["z"], 98)
+    assert d["z"].max() < 8.5, d["z"].max()                      # no crown, no pier, no deck
+    assert len(d["z"]) > 4000                                    # but the roof itself is all there
+
+
+def test_building_model_gives_a_podium_and_a_tower_their_own_walls():
+    """A 20 x 10 m podium at 6 m with a 6 x 6 m tower at 20 m over its middle, plus the tower's wall
+    returns spilling onto the podium roof: the outline walls stop at 6 m, the tower's at 20 m, and
+    the tower's plan is the tower's, not the spill's."""
+    from ducklidar import objects
+    rng = np.random.default_rng(2)
+    ring = np.array([[0.0, 0.0], [20.0, 0.0], [20.0, 10.0], [0.0, 10.0]])
+    px, py = rng.uniform(0, 20, 8000), rng.uniform(0, 10, 8000); pz = np.full(8000, 6.0)
+    under = (px > 7) & (px < 13) & (py > 2) & (py < 8); px, py, pz = px[~under], py[~under], pz[~under]  # no roof seen under the tower
+    tx, ty = rng.uniform(7, 13, 3000), rng.uniform(2, 8, 3000); tz = np.full(3000, 20.0)
+    wx, wy = rng.uniform(4, 16, 600), rng.uniform(1, 9, 600); wz = rng.uniform(7, 19, 600)      # the tower's wall returns, spilling over the podium roof
+    x, y, z = np.r_[px, tx, wx], np.r_[py, ty, wy], np.r_[pz, tz, wz]
+    (soup, cols, kind), = objects.building_model(ring, 0.0, 20.0, x=x, y=y, z=z)
+    T = soup.reshape(-1, 3, 3)
+    n = np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]); vert = np.abs(n[:, 2]) < 0.3 * np.linalg.norm(n, axis=1)
+    W = T[vert]; top = W[:, :, 2].max(1)
+    assert 5.5 < np.median(top[top < 15]) < 6.6                      # the outline walls end at the podium roof
+    tall = W[top > 15]
+    assert len(tall) and 19 < tall[:, :, 2].max() < 21                # the tower has walls to its own roof
+    assert 5.5 < tall[:, :, 0].min() < 8.5 and 11.5 < tall[:, :, 0].max() < 14.5, (tall[:, :, 0].min(), tall[:, :, 0].max())
+
+
+def test_fit_roof_planes_finds_both_slopes_of_a_gable():
+    """A 20 x 12 gable, ridge along x at y = 6, 30 % slopes, 5 cm noise -> two planes, every cell snapped."""
+    from ducklidar import objects
+    rng = np.random.default_rng(3)
+    gy, gx = np.mgrid[0:12, 0:20]
+    top = 6.0 - 0.3 * np.abs(gy + 0.5 - 6.0) + rng.normal(0, 0.05, gy.shape)
+    occ = np.ones_like(top, bool)
+    fitted, n = objects.fit_roof_planes(top, occ, 1.0)
+    assert n == 2, n
+    assert np.abs(fitted - (6.0 - 0.3 * np.abs(gy + 0.5 - 6.0))).max() < 0.25   # within the fitter's own tolerance
+
+
+def test_a_gable_gets_no_walls_inside_its_footprint():
+    """The ridge zone stands 2 m above the eaves but on a slope, not a step: it is not a tier."""
+    from ducklidar import objects
+    rng = np.random.default_rng(4)
+    ring = np.array([[0.0, 0.0], [20.0, 0.0], [20.0, 12.0], [0.0, 12.0]])
+    x, y = rng.uniform(0, 20, 12000), rng.uniform(0, 12, 12000)
+    z = 4.0 + 0.4 * (6.0 - np.abs(y - 6.0)) + rng.normal(0, 0.03, len(x))       # eaves 4 m, ridge 6.4 m
+    (soup, cols, kind), = objects.building_model(ring, 0.0, 6.5, x=x, y=y, z=z)
+    T = soup.reshape(-1, 3, 3)
+    n = np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]); vert = np.abs(n[:, 2]) < 0.3 * np.linalg.norm(n, axis=1)
+    W = T[vert].reshape(-1, 3)
+    inside = (W[:, 0] > 0.3) & (W[:, 0] < 19.7) & (W[:, 1] > 0.3) & (W[:, 1] < 11.7)
+    assert not inside.any(), W[inside][:3]

@@ -196,7 +196,9 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
 
     # ---- write -------------------------------------------------------------------------------
     origin = (centre[0], centre[1], float(V[:, 2].min()))
+    import datetime
     meta = dict(name=name, origin_utm=list(origin), crs="EPSG:26910", up="Y", level=level,
+                built=datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
                 prims=[p["name"] for p in prims], facades=wall_list,
                 z_ground=zg, photos=len(man), poses=len(poses))
     b = Building(glb=None, walls=wall_list, elements={w["id"]: w.get("elements", []) for w in wall_list},
@@ -288,7 +290,8 @@ def _probe(ordered, street, poses, man, camera, wl, log):
         m = wl.lab_median(t, v & top)
         if m is not None: probe.append((float((v & top).mean()), m))
     if probe:
-        log(f"  wall reference colour (Lab) from the best-covered wall: {max(probe)[1].round(0).tolist()}")
+        best = max(probe, key=lambda t: t[0])[1]                  # key: a tie must not fall through to comparing the arrays
+        log(f"  wall reference colour (Lab) from the best-covered wall: {best.round(0).tolist()}")
 
 
 def _write_poses(poses, path):

@@ -7,6 +7,7 @@ write folders; `ducklidar.building3d` reads those folders and never calls any of
     python -m ducklidar.tools.fetch_streetview --ring ring.json --out out/photos
     python -m ducklidar.tools.segment          --photos out/photos
     python -m ducklidar.tools.roofer           --points b.laz --out out/roofer --bin ~/bin/roofer
+    python -m ducklidar.tools.build_tile       --tile tiles/t.parquet --footprints area.duckdb --root .
 
 Nothing is imported here on purpose: importing `ducklidar.tools` must not pull in torch,
 requests or anything else a build does not need.

@@ -5,6 +5,7 @@ writes. Needs a GPU and `transformers` with SAM 3 — which is exactly why it is
 
     python -m ducklidar.tools.segment --photos out/pilot_netloft_photos
     python -m ducklidar.tools.segment --photos out/photos --only 3 7   # redo two photos
+    python -m ducklidar.tools.segment --photos buildings/*/photos      # many folders, ONE model load
 
 **One pass per photo, both prompt sets.** The pilot ran two scripts over the same images and
 paid the image load and the processor twice; the two passes are 60-70 % of a building's
@@ -109,27 +110,34 @@ def main(argv=None):
     import cv2
     from PIL import Image
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--photos", required=True, help="the folder a fetcher wrote (holds the manifest)")
+    ap.add_argument("--photos", required=True, nargs="+", help="folder(s) a fetcher wrote (each holds a manifest)")
     ap.add_argument("--only", type=int, nargs="*", default=[], help="photo indices to (re)do")
     ap.add_argument("--indoor", type=int, nargs="*", default=[], help="indices to skip outright")
     ap.add_argument("--model", default="facebook/sam3")
     ap.add_argument("--force", action="store_true", help="redo photos already segmented")
     a = ap.parse_args(argv)
+    proc, net = load_model(a.model)
+    for folder in a.photos:
+        segment_folder(Path(folder), proc, net, only=set(a.only), indoor=set(a.indoor), force=a.force)
+        print(f"done {folder}", flush=True)         # a driver can build that building now
+    return 0
 
-    photos = Path(a.photos)
+
+def segment_folder(photos, proc, net, only=(), indoor=(), force=False):
+    """Every not-yet-segmented photo of one folder; the model is the caller's, loaded once."""
+    import cv2
+    from PIL import Image
     masks = photos / "masks"; els = photos / "elements"
     masks.mkdir(parents=True, exist_ok=True); els.mkdir(parents=True, exist_ok=True)
     mf = photos / "manifest_all.json"
     if not mf.exists(): mf = photos / "streetview/manifest.json"
     if not mf.exists(): mf = photos / "manifest.json"
     man = [p for p in json.load(open(mf)) if "file" in p]
-    only = set(a.only); indoor = set(a.indoor)
 
-    proc, net = load_model(a.model)
     tiles, flagged = [], []
     for i, p in enumerate(man):
         if i in indoor or p.get("unused") or (only and i not in only): continue
-        if not only and not a.force and (masks / f"{i:02d}_building.png").exists(): continue
+        if not only and not force and (masks / f"{i:02d}_building.png").exists(): continue
         r = segment_photo(proc, net, p["file"])
         cv2.imwrite(str(masks / f"{i:02d}.png"), r["occ"].astype(np.uint8) * 255)
         if r["indoor"]:
@@ -154,7 +162,6 @@ def main(argv=None):
     if flagged:
         json.dump(man, open(mf, "w"), indent=1)
         print(f"manifest updated: {len(flagged)} indoor photos flagged unused")
-    return 0
 
 
 if __name__ == "__main__":
