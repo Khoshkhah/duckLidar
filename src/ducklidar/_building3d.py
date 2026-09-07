@@ -101,11 +101,7 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
     V, T = (geometry.load_solid(solid, solids) if solid is not None
             else fallback_solid(ring, P, zg))
     n = geometry.normals(V, T); centre = V.mean(0)
-    F, slivers = geometry.drop_slivers(geometry.facades(V, T, n, centre))
-    F, inner = geometry.outer_walls(F, ring, base_z=float(V[:, 2].min()))
-    F = geometry.close_corners(F); E = geometry.outer_edges(F)
-    if slivers or inner:
-        log(f"  {len(slivers)} sliver + {len(inner)} interior facades dropped; {len(F)} outer walls")
+    F = geometry.facades(V, T, n, centre); E = geometry.outer_edges(F)
     SOLID = dict(V=V, T=T)
     log(f"solid: {len(V)} vertices, {len(T)} triangles → {len(F)} facades, "
         f"{int((n[:, 2] > 0.3).sum())} roof triangles, {len(E)} outer edges")
@@ -155,10 +151,7 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
         if info is None or tex is None:
             w, h = wl.tex_size(Fk)
             tex = fcompose.compose(w, h, base_mat, [])[0] if base_mat else np.tile(wall_base, (h, w, 1))
-        # every wall is recorded, composed or not — the caller wants the building's plan, not
-        # only the walls a photo happened to reach (Kaveh, 2026-09-06: a run with no photos
-        # reported 0 facades while building 170 of them).
-        if True:
+        if k in done:
             wall_list.append(dict(
                 id=f"facade{k:02d}", w=round(Fk["s1"] - Fk["s0"], 1), h=round(Fk["t1"] - Fk["t0"], 1),
                 facing=round(math.degrees(math.atan2(Fk["n"][1], Fk["n"][0]))),
@@ -167,23 +160,16 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
                 method=(info or {}).get("method", "flat"), filled=(info or {}).get("filled", 0.0),
                 **({"elements": felements.to_json(info["elements"]), "material": info["material"]}
                    if info and info.get("layers") is not None else {})))
-        # THE WALL IS ITS OWN RECTANGLE, NOT THE SOLID'S TRIANGLES. A roofer facade is a set of
-        # coplanar triangles that do NOT tile the plane: railspur facade00 has 11 vertices but only
-        # 7 triangles, in two disconnected patches, so reusing them left a diagonal row of
-        # triangular HOLES through the wall (Kaveh, 2026-09-06 — he sent the picture). The facade's
-        # (s0, s1, t0, t1) box is the wall; two triangles cover it exactly and the texture, whose uv
-        # is defined on that same box, lands right.
-        c = geometry.facade_corners(Fk)                      # TL, TR, BR, BL in UTM
-        vpos = np.asarray(c, float)
-        uv = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
-        idx = np.array([[0, 1, 2], [0, 2, 3]])
+        vid = np.unique(T[Fk["tris"]]); remap = np.full(len(V), -1); remap[vid] = np.arange(len(vid))
+        s = (V[vid] - Fk["p0"]) @ Fk["u"]; t = (V[vid] - Fk["p0"]) @ Fk["v"]
+        uv = np.column_stack([(s - Fk["s0"]) / (Fk["s1"] - Fk["s0"]), (Fk["t1"] - t) / (Fk["t1"] - Fk["t0"])])
         nm = f"facade{k:02d}" + ("_photos" + "-".join(map(str, info["photos"])) if info else "_flat")
         rp = []
         if level == "joinery" and info and info.get("elements"):
             origin_wall = Fk["p0"] + Fk["u"] * Fk["s0"] + Fk["v"] * Fk["t0"]
             rp = frelief.relief_prims(Fk, info["elements"], origin_wall, tex, name=f"facade{k:02d}")
         if rp: prims += rp
-        else: prims.append(dict(pos=vpos, uv=uv, idx=idx, tex=tex, name=nm))
+        else: prims.append(dict(pos=V[vid], uv=uv, idx=remap[T[Fk["tris"]]], tex=tex, name=nm))
         sheet_tiles.append((nm, Fk, tex))
         log(f"  {nm:<26} {Fk['s1']-Fk['s0']:5.1f} × {Fk['t1']-Fk['t0']:4.1f} m  "
             f"facing {math.degrees(math.atan2(Fk['n'][1], Fk['n'][0])):6.1f}°  "
@@ -194,28 +180,14 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
 
     # ---- roof, skylights, floor -------------------------------------------------------------
     boxes = geometry.skylight_boxes(P, rgb, ring)
-    # THE ROOF IS THE TOP, NOT EVERY UPWARD FACE. A roofer solid's upward triangles include canopy
-    # soffits and the undersides of its steps, which sit 1.5-4 m up; drawn as roof they hung down
-    # OVER the walls as sloping panels around the building (Kaveh, 2026-09-06). A roof triangle has
-    # to stand near the top of its own column: keep those within 3 m of the highest roof face over
-    # the same spot, which keeps a real multi-level roof and drops the low fringe.
-    up = np.flatnonzero(n[:, 2] > 0.3)
-    zc = V[T[up]].mean(1)[:, 2]
-    roof = up[zc >= np.percentile(zc, 5) - 0.5] if len(up) else up
-    if len(roof):
-        tall = zc[zc >= np.percentile(zc, 5) - 0.5]
-        keep = tall >= (V[:, 2].min() + 0.55 * (tall.max() - V[:, 2].min()))
-        if keep.sum() >= 4: roof = roof[keep]
-    vid = np.unique(T[roof])
+    roof = np.flatnonzero(n[:, 2] > 0.3); vid = np.unique(T[roof])
     remap = np.full(len(V), -1); remap[vid] = np.arange(len(vid))
     bbox = (V[:, 0].min() - 1, V[:, 1].min() - 1, V[:, 0].max() + 1, V[:, 1].max() + 1)
     rtex, roof_base = wl.roof_texture(P, rgb, bbox, ring, [b["corners"] for b in boxes])
     log(f"  roof base colour (median of flat roof returns): {roof_base.round(0).astype(int).tolist()}")
     uv = np.column_stack([(V[vid, 0] - bbox[0]) / (bbox[2] - bbox[0]),
                           (bbox[3] - V[vid, 1]) / (bbox[3] - bbox[1])])
-    rvid = np.unique(T[roof]); rremap = np.full(len(V), -1); rremap[rvid] = np.arange(len(rvid))
-    ruv = np.column_stack([(V[rvid, 0] - bbox[0]) / (bbox[2] - bbox[0]), (bbox[3] - V[rvid, 1]) / (bbox[3] - bbox[1])])
-    prims.append(dict(pos=V[rvid], uv=ruv, idx=rremap[T[roof]], tex=rtex, name="roof_lidar"))
+    prims.append(dict(pos=V[vid], uv=uv, idx=remap[T[roof]], tex=rtex, name="roof_lidar"))
     for j, b in enumerate(boxes): prims.append(geometry.box_prim(b, f"skylight{j:02d}"))
     prims.append(geometry.floor_prim(ring, float(V[:, 2].min()) - 0.02))
     log(f"  floor: footprint slab at z = {V[:, 2].min():.2f} m")
