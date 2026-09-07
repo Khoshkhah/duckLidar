@@ -72,3 +72,24 @@ __all__ = [
     "car_split", "footprint_cells", "footprint_ids", "map_vetoes",
     "marina_superstructure", "raft_split",
 ]
+
+
+def __getattr__(name):
+    """`dl.building3d` without paying cv2/scipy on every `import ducklidar`.
+
+    The building pipeline pulls OpenCV and scikit-image; most of this library does not, and
+    keeping `import ducklidar` cheap is one of its rules. So the name resolves on first use,
+    like `ducklidar.facade` does. `from ducklidar import building, glb, building3d` works too.
+    """
+    if name in ("building3d", "Building"):
+        # `dl.building3d(...)` is the documented call, so this name is the FUNCTION. Its module
+        # is `_building3d` precisely so the two never collide over one name.
+        from ._building3d import Building, building3d
+        globals().update(building3d=building3d, Building=Building)
+        return globals()[name]
+    if name in ("building", "facade", "glb", "scene", "tools"):
+        import importlib
+        mod = importlib.import_module(f".{name}", __name__)
+        globals()[name] = mod
+        return mod
+    raise AttributeError(f"module {__name__!r} has no attribute {name!r}")

@@ -36,7 +36,7 @@ Where this departs from the design note, and why (all measured on the pilot phot
 Extra result keys for QA: run (eave u-extent), modes (every side mode with its anchors), peaks
 (the accepted ones), quad_raw (the corners before the sanity check).
 """
-import math, os, sys
+import math
 import cv2
 import numpy as np
 

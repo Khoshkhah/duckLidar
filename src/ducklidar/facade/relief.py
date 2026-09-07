@@ -16,14 +16,12 @@ surface with its own normal that catches the sun at any zoom.
 Elements outside the polygon stay texture-only (relief never invents mesh); a wall without elements returns []
 and keeps its flat prim. The pose is never used here — everything is metric wall coordinates from parse_wall.
 """
-import sys
 from pathlib import Path
 
 import numpy as np
 import shapely
 from shapely.geometry import LineString, Polygon, box
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 INSET = dict(window=0.08, storefront=0.08, door=0.15)       # m into the wall. The WINDOW path no longer uses this
                                                             # (superseded by FRAME_PROUD + GLASS_BACK = 0.055 m); it still
@@ -285,7 +283,7 @@ def _frame_colour(tex, layers, rect, material_median):
     Falls back to material_median x 1.4 when the ring is too small or is not distinguishable from the wall (median L
     within 8 of it): a light frame is the safe default for both pilot buildings.
     Reference (railspur facade02): per-window medians ~[136,133,121]..[92,93,91], overall ~[118,121,114], wall ~[62,63,52]."""
-    import facade_compose as fc
+    from . import compose as fc
     h, w = tex.shape[:2]
     fb = np.clip(np.asarray(material_median, float) * 1.4, 0, 255)
     p = fc._px(rect, w, h)
@@ -306,7 +304,7 @@ def _glass_tex(material_median):
     crop gate refused it): a 64-row vertical ramp, sky-lit blue-grey at the top to darker at the bottom, built the
     same way compose.synth builds its glass band (Lab L 62 +/- 10, a 128, b 118). One prim per wall, never one
     per opening."""
-    import facade_compose as fc
+    from . import compose as fc
     grad = np.linspace(10, -10, 64, dtype=np.float32)[:, None]
     L0 = float(fc._rgb2lab(np.asarray(material_median, np.uint8).reshape(1, 3))[0, 0]) * GLASS_SHADE
     lab = np.zeros((64, 4, 3), np.float32); lab[..., 0] = max(20.0, L0) + grad; lab[..., 1] = 128; lab[..., 2] = 118

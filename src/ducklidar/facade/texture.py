@@ -24,6 +24,12 @@ class Context:
     CAM_H = 2.3            # m: camera height above ground for a street-level photo
     SOLID = {}             # dict(V=(n,3), T=(m,3)) of the building's solid, or {} to skip self-occlusion
     occlusion_map = None   # f(F, cam, w, h) -> (visible mask (h,w) bool, fraction)
+    # ducklidar.building fills these in as well (they were build_model module globals)
+    PHOTOS = None          # Path: the photo folder a fetcher wrote (manifest + masks/ + elements/)
+    MASKS = None           # Path: occluder / building masks, NN.png and NN_building.png
+    MANIFEST = []          # the photo list, for the per-photo `valid` masks
+    CLICKS = None          # Path: clicks.json from the dashboard, or None
+    W = 640                # px: the photos are square, W x W
 
     def use(self, **kw):
         for k, v in kw.items(): setattr(self, k, v)
@@ -33,14 +39,13 @@ class Context:
 CTX = Context()
 
 
-import json, math, os, sys
+import json, math
 from pathlib import Path
 
 import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from . import fill, quad, rectify, stitch
 
 TEX_M = rectify.TEX_M
@@ -181,7 +186,6 @@ LAYER_PAL = np.array([[40, 40, 40], [80, 160, 255], [255, 120, 40], [255, 230, 6
 
 def _diagram(info, flip):
     """elements.diagram of the wall, drawn mirrored when the sheet is flipped (labels stay readable)."""
-    import facade_elements
     W_m, H_m = info["size"]; els = info["elements"]
     if flip: els = [dict(e, x0=W_m - e["x1"], x1=W_m - e["x0"], lights=[[W_m - l[2], l[1], W_m - l[0], l[3]] for l in e.get("lights", [])]) for e in els]
     from . import elements as _elements

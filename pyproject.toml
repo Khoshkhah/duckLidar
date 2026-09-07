@@ -31,6 +31,13 @@ scene = ["scipy>=1.10", "shapely>=2.0", "mapbox_earcut>=1.0", "scikit-image>=0.2
 overture = ["duckdb>=1.0", "pyproj>=3.5"]
 # facade textures from street photos (ducklidar.facade)
 facade = ["scikit-image>=0.22", "shapely>=2.0"]
+# building3d() — the whole building: facade + the solid fallback + the GLB writer
+building = ["scikit-image>=0.22", "shapely>=2.0", "mapbox_earcut>=1.0", "opencv-python>=4.8", "pillow>=10"]
+# tools/fetch_streetview.py — a Street View sweep (stdlib urllib; the key is yours)
+streetview = ["shapely>=2.0", "pyproj>=3.5", "pillow>=10", "matplotlib>=3.7"]
+# tools/segment.py — SAM 3 masks, needs a GPU. Never imported by a build.
+sam = ["transformers>=4.46", "torch>=2.1", "opencv-python>=4.8", "pillow>=10"]
+# tools/roofer.py needs NOTHING: roofer is GPL and runs as a subprocess you install yourself
 dev = ["pytest>=7", "duckdb>=1.0", "pyproj>=3.5", "scipy>=1.10", "cloth-simulation-filter>=1.1", "matplotlib>=3.7", "pillow>=10", "scikit-image>=0.22", "shapely>=2.0", "mapbox_earcut>=1.0", "ipykernel>=6"]
 
 [tool.setuptools.packages.find]

@@ -10,13 +10,12 @@ nested double windows); six data-driven gates and a small wall grammar keep what
 Conventions: wall metres x from the s0 end, y UP from the wall base (y = H_m at the eave); texture px col = x / TEX_M,
 row = h - y / TEX_M (row 0 = top). photo px -> strip px: sm["H"]; strip px -> texture px: (c - px + dx, r - py + dy).
 """
-import json, os, sys, time
+import json, time
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from . import texture as _texture                            # own_building: the chroma-restricted building mask
 
 TEX_M = 0.04

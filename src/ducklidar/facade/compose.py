@@ -14,13 +14,11 @@ end, y UP from the wall base), src_kind 'photo'|'sibling'|'synth', crop RGB uint
 lights int (or None). Texture px: col = round(x / TEX_M), row = h - round(y / TEX_M) (row 0 = top of wall).
 """
 import math
-import sys
 from pathlib import Path
 
 import cv2
 import numpy as np
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
 from . import fill
 
 TEX_M = 0.04
@@ -121,7 +119,7 @@ def synth(kind, wc, hc, material, lights=None):
 
 def _stretch_ok(m, rect_w):
     """The gate's stretch leg, on a crop we are about to resize to rect_w metres (elements.crop_ok, one predicate)."""
-    import facade_elements
+    from . import elements
     ppm = m.get("crop_ppm") or (m["crop"].shape[1] / max(_rect(m)[2] - _rect(m)[0], 1e-6))     # no recorded ppm: the crop's own texels are its resolution
     # ppm floored and oblique/date passed as pass-values on purpose: parse_wall already judged the SOURCE, this is only the resize
     return elements.crop_ok(max(ppm, elements.GATE_PPM), 1.0, None, rect_w, _rect(m)[2] - _rect(m)[0]) is None
