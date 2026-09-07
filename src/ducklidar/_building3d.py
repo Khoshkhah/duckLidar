@@ -160,16 +160,23 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
                 method=(info or {}).get("method", "flat"), filled=(info or {}).get("filled", 0.0),
                 **({"elements": felements.to_json(info["elements"]), "material": info["material"]}
                    if info and info.get("layers") is not None else {})))
-        vid = np.unique(T[Fk["tris"]]); remap = np.full(len(V), -1); remap[vid] = np.arange(len(vid))
-        s = (V[vid] - Fk["p0"]) @ Fk["u"]; t = (V[vid] - Fk["p0"]) @ Fk["v"]
-        uv = np.column_stack([(s - Fk["s0"]) / (Fk["s1"] - Fk["s0"]), (Fk["t1"] - t) / (Fk["t1"] - Fk["t0"])])
+        # THE WALL IS ITS OWN RECTANGLE, NOT THE SOLID'S TRIANGLES. A roofer facade is a set of
+        # coplanar triangles that do NOT tile the plane: railspur facade00 has 11 vertices but only
+        # 7 triangles, in two disconnected patches, so reusing them left a diagonal row of
+        # triangular HOLES through the wall (Kaveh, 2026-09-06 — he sent the picture). The facade's
+        # (s0, s1, t0, t1) box is the wall; two triangles cover it exactly and the texture, whose uv
+        # is defined on that same box, lands right.
+        c = geometry.facade_corners(Fk)                      # TL, TR, BR, BL in UTM
+        vpos = np.asarray(c, float)
+        uv = np.array([[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]])
+        idx = np.array([[0, 1, 2], [0, 2, 3]])
         nm = f"facade{k:02d}" + ("_photos" + "-".join(map(str, info["photos"])) if info else "_flat")
         rp = []
         if level == "joinery" and info and info.get("elements"):
             origin_wall = Fk["p0"] + Fk["u"] * Fk["s0"] + Fk["v"] * Fk["t0"]
             rp = frelief.relief_prims(Fk, info["elements"], origin_wall, tex, name=f"facade{k:02d}")
         if rp: prims += rp
-        else: prims.append(dict(pos=V[vid], uv=uv, idx=remap[T[Fk["tris"]]], tex=tex, name=nm))
+        else: prims.append(dict(pos=vpos, uv=uv, idx=idx, tex=tex, name=nm))
         sheet_tiles.append((nm, Fk, tex))
         log(f"  {nm:<26} {Fk['s1']-Fk['s0']:5.1f} × {Fk['t1']-Fk['t0']:4.1f} m  "
             f"facing {math.degrees(math.atan2(Fk['n'][1], Fk['n'][0])):6.1f}°  "
@@ -187,7 +194,9 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
     log(f"  roof base colour (median of flat roof returns): {roof_base.round(0).astype(int).tolist()}")
     uv = np.column_stack([(V[vid, 0] - bbox[0]) / (bbox[2] - bbox[0]),
                           (bbox[3] - V[vid, 1]) / (bbox[3] - bbox[1])])
-    prims.append(dict(pos=V[vid], uv=uv, idx=remap[T[roof]], tex=rtex, name="roof_lidar"))
+    rvid = np.unique(T[roof]); rremap = np.full(len(V), -1); rremap[rvid] = np.arange(len(rvid))
+    ruv = np.column_stack([(V[rvid, 0] - bbox[0]) / (bbox[2] - bbox[0]), (bbox[3] - V[rvid, 1]) / (bbox[3] - bbox[1])])
+    prims.append(dict(pos=V[rvid], uv=ruv, idx=rremap[T[roof]], tex=rtex, name="roof_lidar"))
     for j, b in enumerate(boxes): prims.append(geometry.box_prim(b, f"skylight{j:02d}"))
     prims.append(geometry.floor_prim(ring, float(V[:, 2].min()) - 0.02))
     log(f"  floor: footprint slab at z = {V[:, 2].min():.2f} m")
