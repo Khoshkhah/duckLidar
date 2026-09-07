@@ -21,6 +21,7 @@ questioned for optimization part by part.
 - [Stage 6 — instances](stage6-instances.md)
 - [Stage 7 — scene build](stage7-scene.md)
 - [Stage 8 — shadows](stage8-shadows.md)
+- [`dl.building3d(osm_id)` — one call, one textured 3-D building](building3d.md) — **proposal 2026-09-06**
 
 ## The four invariants (hold everywhere; break one and it's a bug)
 
