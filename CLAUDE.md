@@ -30,7 +30,8 @@ Tools (run, never imported by a build — each spends an API quota, a GPU, or a 
 
 ```bash
 $PY -m ducklidar.tools.build_tile --tile tiles/490000_5457000.parquet --footprints footprints/granville_island.duckdb --root .
-$PY -m ducklidar.tools.dashboard  --root . --out out/dashboard.html    # one self-contained page of every out/<id>/building.glb
+$PY -m ducklidar.tools.dashboard  --root . --out out/dashboard.html --only <ids>   # one page: returns, model, plan (three outlines), photos; --only keeps it small
+$PY -m ducklidar.tools.map        --tile ... --footprints ... --root .   # a Leaflet map of the tile's footprints with ids and Google Earth links
 $PY -m ducklidar.tools.roofer / fetch_streetview / segment              # see each module's docstring
 ```
 
@@ -105,5 +106,7 @@ every constant in a type test carries the population that justified it in its do
   `building3d: a wall reaches the ground, and the roof is the top`.
 - `roofer` is GPL-3: always a subprocess via `tools/roofer.py`, never linked or installed as a
   dependency. `segment` needs a GPU; `fetch_streetview` needs the user's own key.
+- **The plan of a model is the Overture footprint, exactly** (Kaveh, 2026-09-07). The survey decides
+  only what stands on it. `docs/footprints.md` explains the three outlines the dashboard draws.
 - Every point carries a `pid` join key from the store; building folder ids are
   `gers_<first 8 chars of the Overture id>` (or `w<osm way id>`), see `docs/data-layout.md`.

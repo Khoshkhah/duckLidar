@@ -181,7 +181,12 @@ def building_points(footprint, store, *, eave=EAVE, labels=None, keep_classes=(3
         bld, g = np.isin(cls, (BUILDING, UNCLASSIFIED)), (cls == GROUND) & inside
         z_ground = (float(np.median(z[g])) if g.sum() >= MIN_CLASSIFIED
                     else float(np.percentile(z[inside], GROUND_PCT)) if inside.any() else 0.0)
-        if (core & (cls == BUILDING)).sum() >= MIN_CLASSIFIED:  # the survey says which returns are building
+        if (cls == GROUND).sum() >= MIN_CLASSIFIED and (core & (cls == BUILDING)).sum() < MIN_CLASSIFIED:
+            # a classified survey with no building return inside the footprint: a parking lot, a
+            # cleared site, a shed under a crown — NOT a building. 14 of Granville Island's 248
+            # (gers_06c1f1c6, an OSM parking way, got a 4.4 m box of cars and trees, 2026-09-07).
+            keep = np.zeros(len(x), bool)
+        elif (core & (cls == BUILDING)).sum() >= MIN_CLASSIFIED:  # the survey says which returns are building
             ncell = len(np.unique(np.floor(x[core]).astype(np.int64) * 1_000_003 + np.floor(y[core]).astype(np.int64)))
             m6, m1 = core & (cls == BUILDING), core & (cls == UNCLASSIFIED)
             hi = roof_top(x[m6], y[m6], z[m6], ncell, z_ground, x[m1], y[m1], z[m1])

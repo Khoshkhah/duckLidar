@@ -48,6 +48,18 @@ def footprints(db, extent, crs=CRS):
     return [(i, json.loads(gj)["coordinates"][0]) for i, gj in rows]
 
 
+def neighbours_of(fps, reach=6.0):
+    """-> {overture id: [rings of the other footprints within `reach` m]} — the plan must stop at them."""
+    import shapely
+    polys = [shapely.Polygon(r) for _, r in fps]
+    tree = shapely.STRtree(polys)
+    out = {}
+    for k, (oid, ring) in enumerate(fps):
+        near = tree.query(polys[k].buffer(reach), predicate="intersects")
+        out[oid] = [fps[j][1] for j in near if j != k]
+    return out
+
+
 def tile_extent(tile):
     """(x0, y0, x1, y1) from the Parquet row-group statistics — no points are read."""
     import pyarrow.parquet as pq
@@ -71,9 +83,29 @@ def _fetch(args):
     return bdir.name, r.returncode, (r.stdout + r.stderr).strip().splitlines()[-1:]
 
 
+def _check(args):
+    """The survey's verdict on a building's bought photos: `unused` where a camera cannot see the wall."""
+    bdir, tile = args
+    import numpy as np
+    from shapely.geometry import Polygon
+    from ducklidar.building.points import building_points
+    from ducklidar.tools.fetch_streetview import survey_check
+    mf = bdir / "photos" / "streetview" / "manifest.json"
+    man = json.loads(mf.read_text()); ring = json.loads((bdir / "footprint.json").read_text())["ring"]
+    todo = [p for p in man if "file" in p and not p.get("survey")]
+    if not todo: return bdir.name, 0, 0
+    zg = building_points(ring, tile)["z_ground"]
+    survey_check(Polygon(ring), todo, tile, zg)
+    n_bad = 0
+    for p in todo:
+        if p["survey"] != "ok" and not p.get("unused"): p["unused"] = p["survey"]; n_bad += 1
+    mf.write_text(json.dumps(man, indent=1))
+    return bdir.name, len(todo), n_bad
+
+
 def _build(args):
     """One `building3d`, in a worker; returns (id, level, error or None)."""
-    bid, ring, tile, bdir, odir, level = args
+    bid, ring, tile, bdir, odir, level, nbs = args
     import numpy as np
     import ducklidar as dl
     from ducklidar.building.points import building_points
@@ -81,10 +113,34 @@ def _build(args):
     lvl = level if (photos / "streetview" / "manifest.json").exists() else "material"
     try:
         d = building_points(ring, tile)
-        np.savez(bdir / "points.npz", **d)          # the dashboard shows these next to the model
-        dl.building3d(ring, points=d, photos=photos if lvl != "material" else None,
-                      solid=next(bdir.glob("*.city.json"), None), out=odir, level=lvl, name=bid,
-                      log=lambda *_: None)
+        if len(d["z"]) < 20:                          # the survey shows no building here: no model, and no stale one either
+            for f in odir.glob("*"): f.unlink()
+            return bid, "none", None
+        b = dl.building3d(ring, points=d, photos=photos if lvl != "material" else None,
+                          solid=next(bdir.glob("*.city.json"), None), out=odir, level=lvl, name=bid,
+                          log=lambda *_: None, neighbours=nbs)
+        # the dashboard shows the returns the blue outline is traced from: within 1.5 m of the footprint
+        # and outside every neighbour's — not the 3 m collar, whose returns beside a bigger neighbour
+        # are the neighbour's, and not the footprint alone, which left the blue line in empty space
+        import shapely
+        keep = shapely.contains_xy(shapely.Polygon(np.asarray(ring, float)).buffer(1.5), d["x"], d["y"])
+        for nb in nbs: keep &= ~shapely.contains_xy(shapely.Polygon(np.asarray(nb, float)), d["x"], d["y"])
+        d = {k: (v[keep] if isinstance(v, np.ndarray) and v.shape[:1] == keep.shape else v) for k, v in d.items()}
+        np.savez(bdir / "points.npz", **d)
+        # both outlines, for the dashboard to set side by side: the map's, and the one the returns draw
+        from ducklidar.objects import survey_outline, survey_footprint
+        from shapely.geometry import Polygon
+        pts0 = building_points(ring, tile)
+        meta = json.loads((odir / "meta.json").read_text())
+        meta["footprint"] = [list(map(float, q)) for q in ring]
+        outl = survey_outline(ring, pts0["x"], pts0["y"], pts0["z"], neighbours=nbs)
+        meta["survey_outline"] = [[list(map(float, q)) for q in r] for r in outl]
+        prop = survey_footprint(ring, max(outl, key=lambda r: Polygon(r).area)) if outl else None
+        meta["survey_footprint"] = [list(map(float, q)) for q in prop] if prop is not None else []
+        A, B = Polygon(ring), (Polygon(prop) if prop is not None else None)
+        meta["footprint_iou"] = round(A.intersection(B).area / A.union(B).area, 3) if B is not None and B.is_valid else None
+        meta["footprint_area"] = round(A.area, 1); meta["survey_footprint_area"] = round(B.area, 1) if B is not None else None
+        (odir / "meta.json").write_text(json.dumps(meta, indent=1))
         return bid, lvl, None
     except Exception as e:                       # one bad footprint must not stop the other 247
         return bid, lvl, f"{type(e).__name__}: {e}"
@@ -92,6 +148,7 @@ def _build(args):
 
 def dashboard(root):
     """Refresh `out/dashboard.html` over everything built so far."""
+    if getattr(dashboard, "off", False): return
     subprocess.run([sys.executable, "-m", "ducklidar.tools.dashboard", "--root", str(root),
                     "--out", str(root / "out" / "dashboard.html")], capture_output=True)
 
@@ -115,11 +172,14 @@ def main(argv=None):
     ap.add_argument("--jobs", type=int, default=8, help="parallel fetches / builds (default 8)")
     ap.add_argument("--only", nargs="*", default=(), help="building ids to build (default: all)")
     ap.add_argument("--force", action="store_true", help="rebuild even where out/<id> is already at that level")
+    ap.add_argument("--no-dashboard", action="store_true", help="do not refresh out/dashboard.html (a page of 248 buildings is 400 MB)")
     a = ap.parse_args(argv)
 
     root = Path(a.root)
+    dashboard.off = a.no_dashboard
     ext = tile_extent(a.tile)
     fps = footprints(a.footprints, ext)
+    nbs = neighbours_of(fps)                       # from ALL footprints in the tile, before --only narrows the list
     if a.only: fps = [(i, r) for i, r in fps if "gers_" + i[:8] in set(a.only)]
     print(f"{len(fps)} footprints wholly inside {a.tile} ({ext[0]:.0f},{ext[1]:.0f})..({ext[2]:.0f},{ext[3]:.0f})")
     todo = []
@@ -130,33 +190,44 @@ def main(argv=None):
         fp = bdir / "footprint.json"
         if not fp.exists():
             fp.write_text(json.dumps({"id": oid, "source": "overture", "crs": f"EPSG:{CRS}", "ring": ring}, indent=1))
-        todo.append((bid, ring, bdir, root / "out" / bid))
+        todo.append((bid, ring, bdir, root / "out" / bid, nbs.get(oid, [])))
 
     if a.env:
         t0 = time.time()
-        need = [(b, a.env, a.footprints) for _, _, b, _ in todo if not (b / "photos" / "streetview" / "manifest.json").exists()]
+        need = [(b, a.env, a.footprints) for _, _, b, _, _ in todo if not (b / "photos" / "streetview" / "manifest.json").exists()]
         print(f"fetch: {len(need)} buildings without photos", flush=True)
         with ProcessPoolExecutor(a.jobs) as ex:
             for k, (bid, rc, tail) in enumerate(ex.map(_fetch, need), 1):
                 print(f"  {bid}  {'ok' if rc == 0 else 'FAILED'}  {' '.join(tail)}  ({k}/{len(need)}, {time.time() - t0:.0f} s)", flush=True)
 
-    def job(bid, ring, bdir, odir):
+    def job(bid, ring, bdir, odir, nb):
         """The build this building's inputs allow now, or None when out/ already has it."""
         want = a.level if (bdir / "photos" / "streetview" / "manifest.json").exists() else "material"
         if not a.force and (odir / "building.glb").exists() and built_level(odir) == want:
             return None
-        return (bid, ring, a.tile, bdir, odir, want)
+        return (bid, ring, a.tile, bdir, odir, want, nb)
+
+    # THE SURVEY CHECKS EVERY PHOTO — the bought ones too: a camera on the bridge deck, or one
+    # with a crown between it and the wall, is flagged unused, and segment and build skip it
+    have = [(b, a.tile) for _, _, b, _, _ in todo if (b / "photos" / "streetview" / "manifest.json").exists()]
+    if have:
+        t0 = time.time(); checked = flagged = 0
+        with ProcessPoolExecutor(a.jobs) as ex:
+            for bid, n, bad in ex.map(_check, have):
+                checked += n; flagged += bad
+        print(f"survey check: {checked} photos checked, {flagged} flagged unused ({time.time() - t0:.0f} s)", flush=True)
 
     t0 = time.time()
     done = {"built": 0, "failed": []}
 
     def report(bid, lvl, err):
         if err: done["failed"].append((bid, err)); print(f"  {bid}  FAILED {err}", flush=True)
+        elif lvl == "none": done["skipped"] = done.get("skipped", 0) + 1; print(f"  {bid}  no building returns — skipped", flush=True)
         else: done["built"] += 1; print(f"  {bid}  {lvl:8s} built  ({time.time() - t0:.0f} s)", flush=True)
 
     with ProcessPoolExecutor(a.jobs) as ex:
         if a.segment:
-            by_folder = {str(b / "photos"): (bid, r, b, o) for bid, r, b, o in todo
+            by_folder = {str(b / "photos"): (bid, r, b, o, nb) for bid, r, b, o, nb in todo
                          if (b / "photos" / "streetview" / "manifest.json").exists()}
             print(f"segment: {len(by_folder)} photo folders (already-segmented photos are skipped)", flush=True)
             seg = subprocess.Popen([sys.executable, "-m", "ducklidar.tools.segment", "--photos", *by_folder],
@@ -183,7 +254,7 @@ def main(argv=None):
         for bid, lvl, err in ex.map(_build, jobs):
             report(bid, lvl, err)
         if jobs: dashboard(root)
-    print(f"built {done['built']}, kept {kept}, failed {len(done['failed'])} in {time.time() - t0:.0f} s", flush=True)
+    print(f"built {done['built']}, kept {kept}, skipped {done.get('skipped', 0)} (no building returns), failed {len(done['failed'])} in {time.time() - t0:.0f} s", flush=True)
     for bid, err in done["failed"]:
         print(f"  {bid}: {err}")
     return 1 if done["failed"] else 0

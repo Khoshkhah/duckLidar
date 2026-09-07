@@ -378,7 +378,10 @@ def solid_25d(x, y, z, z0, pix=1.0):
 ROOF_SPAN = 0.30     # a real roof is a thin band at the top of a building;
                      # measured over roofer's 152 solids the span/height median
                      # is 0.33 and 54 exceed 0.50 — those are not roofs
-ROOF_TOL = 0.25      # m — a cell this close to a plane belongs to it
+ROOF_TOL = 0.15      # m — a cell this close to a plane belongs to it. [measured] 2026-09-07, gers_08133905:
+                     # its east roof is a 3-4 degree gable, 6.0 -> 6.5 -> 6.4 m across, and its west block a
+                     # 30 cm crest along its length; at 0.25 both were one plane, at 0.15 each is two slopes
+                     # facing apart, while a steep gable keeps its three planes and a flat roof its eight
 ROOF_MIN = 12        # cells — smaller than this is not a roof facet
 
 
@@ -399,7 +402,228 @@ def cell_quantile(x, y, z, lo, shape, pix, q=0.25, min_n=1):
     return out.reshape(shape)
 
 
-def roof_surface(ring, rim_xy, rim_z, fitted, occ, lo, pix, planes=None, exclude=()):
+def clip_surface(plan, T):
+    """Triangles (n, 3, 3) clipped to shapely `plan`: whole inside, cut on the outline, none outside.
+    A cut piece is ear-cut and takes its heights from the source triangle's own plane."""
+    import shapely
+    import mapbox_earcut
+    out = []
+    for t in np.asarray(T, float):
+        pg = shapely.Polygon(t[:, :2])
+        if not pg.is_valid or pg.area < 1e-9: continue
+        if plan.contains(pg):
+            out.append(t); continue
+        inter = plan.intersection(pg)
+        if inter.is_empty: continue
+        # the plane through the triangle: z = a x + b y + c
+        A = np.column_stack([t[:, 0], t[:, 1], np.ones(3)])
+        try:
+            a, b, c = np.linalg.solve(A, t[:, 2])
+        except np.linalg.LinAlgError:
+            a, b, c = 0.0, 0.0, float(t[:, 2].mean())
+        for piece in (inter.geoms if hasattr(inter, "geoms") else [inter]):
+            if piece.geom_type != "Polygon" or piece.area < 1e-9: continue
+            xy = np.asarray(piece.exterior.coords)[:-1]
+            if len(xy) < 3: continue
+            idx = mapbox_earcut.triangulate_float64(xy, np.array([len(xy)], np.uint32)).reshape(-1, 3)
+            P3 = np.column_stack([xy, a * xy[:, 0] + b * xy[:, 1] + c])
+            out.extend(P3[idx])
+    return np.asarray(out, float).reshape(-1, 3, 3)
+
+
+def surface_z(T, xy):
+    """Height of surface `T` (n, 3, 3) at each `xy`: barycentric on the triangle holding the point,
+    the nearest triangle's plane where none does (a point on the outline, a hair outside)."""
+    import shapely
+    from shapely.strtree import STRtree
+    polys = [shapely.Polygon(t[:, :2]) for t in T]
+    tree = STRtree(polys)
+    pts = shapely.points(xy)
+    out = np.full(len(xy), np.nan)
+    hit = tree.query(pts, predicate="intersects")           # (2, k): point index, triangle index
+    for i, j in zip(*hit):
+        if np.isfinite(out[i]): continue
+        t = T[j]
+        A = np.column_stack([t[:, 0], t[:, 1], np.ones(3)])
+        try: a, b, c = np.linalg.solve(A, t[:, 2]); out[i] = a * xy[i, 0] + b * xy[i, 1] + c
+        except np.linalg.LinAlgError: out[i] = t[:, 2].mean()
+    miss = np.nonzero(~np.isfinite(out))[0]
+    if len(miss):
+        near = tree.nearest(shapely.points(xy[miss]))
+        for i, j in zip(miss, near):
+            t = T[j]; A = np.column_stack([t[:, 0], t[:, 1], np.ones(3)])
+            try: a, b, c = np.linalg.solve(A, t[:, 2]); v = a * xy[i, 0] + b * xy[i, 1] + c
+            except np.linalg.LinAlgError: v = t[:, 2].mean()
+            out[i] = float(np.clip(v, t[:, 2].min(), t[:, 2].max()))   # never extrapolate a steep triangle's plane (78 m walls)
+    return out
+
+
+def plan_walls(plan, T, z0, pix=1.0):
+    """The walls of a roof surface `T` along shapely `plan`'s outline: every `pix` along each edge
+    the roof's own height there, dropped to `z0`. Outward winding for a ccw plan."""
+    import shapely
+    soup = []
+    ccw = plan.exterior.is_ccw
+    for ring_ in [plan.exterior]:
+        r = np.asarray(ring_.coords)[:-1]
+        if not ccw: r = r[::-1]
+        for k in range(len(r)):
+            a, b = r[k], r[(k + 1) % len(r)]
+            m = max(1, int(np.ceil(np.hypot(*(b - a)) / pix)))
+            pts = a + np.linspace(0, 1, m + 1)[:, None] * (b - a)
+            zt = surface_z(T, pts)
+            for i in range(m):
+                soup.append([[*pts[i], z0], [*pts[i + 1], z0], [*pts[i + 1], zt[i + 1]],
+                             [*pts[i], z0], [*pts[i + 1], zt[i + 1]], [*pts[i], zt[i]]])
+    return [np.asarray(w, float) for w in soup]
+
+
+def planar_roof(ring, fitted, occ, lo, pix, planes, exclude=(), zmin=None, z0=None):
+    """The roof as PLANE POLYGONS: one polygon per connected region of cells on a fitted plane, its
+    vertices on that plane, clipped to the plan `ring` minus `exclude`. Where two regions' planes
+    meet within their shared boundary the boundary's vertices move onto the intersection line (a
+    ridge, a hip); where they do not, a vertical riser joins them (a step). Cells no plane claims
+    join the nearest region. -> (n, 3) triangle soup, or None when there are no planes.
+
+    A triangulation of cell centres with rim samples, ridge points and risers stitched in showed
+    every stitch as a dent, and gers_0112d1b3's gable read as a lumpy slab (2026-09-07).
+    """
+    import shapely
+    import mapbox_earcut
+    from scipy import ndimage as ndi
+    from shapely.geometry import Polygon
+    pid_all, coefs = planes
+    if not coefs: return None
+    plan = Polygon(np.asarray(ring, float))
+    for ex in exclude: plan = plan.difference(ex)
+    gy, gx = np.mgrid[0:fitted.shape[0], 0:fitted.shape[1]]
+    cx, cy = lo[0] + (gx + 0.5) * pix, lo[1] + (gy + 0.5) * pix
+    inside = np.isfinite(fitted) & shapely.contains_xy(plan.buffer(0.75 * pix), cx, cy)   # every cell whose BOX touches the plan
+    # (a centre 0.6 m out along a diagonal eave still covers a corner of it — left out, that corner was a missing fin)
+    if zmin is not None: inside &= fitted >= zmin                                          # no return landed, the fill
+    if inside.sum() < 3: return None
+    pid = np.where(inside, pid_all, -1)
+    coefs = list(coefs)
+    def pz(k, xy):
+        a, b, c = coefs[k]; xy = np.asarray(xy, float).reshape(-1, 2)
+        return a * (xy[:, 0] - lo[0] - 0.5 * pix) + b * (xy[:, 1] - lo[1] - 0.5 * pix) + c
+    # a loose cell joins the nearest plane region IF that plane passes within 1.5 m of its own height —
+    # a terrace's slope extrapolated across the cells it never fitted reached 61 m (gers_0d3841e4);
+    # the rest become flat patches at their own height
+    loose = inside & (pid < 0)
+    if loose.any() and (pid >= 0).any():
+        ii = ndi.distance_transform_edt(pid < 0, return_distances=False, return_indices=True)
+        near = pid[tuple(ii)]
+        rr, cc = np.nonzero(loose)
+        for r, c in zip(rr, cc):
+            k = near[r, c]
+            if k >= 0 and abs(pz(k, [[cx[r, c], cy[r, c]]])[0] - fitted[r, c]) <= 1.5: pid[r, c] = k
+    loose = inside & (pid < 0)
+    if loose.any():
+        lab, n = ndi.label(loose)
+        ii = ndi.distance_transform_edt(pid < 0, return_distances=False, return_indices=True)
+        near = pid[tuple(ii)]
+        core = shapely.contains_xy(plan.buffer(-0.6 * pix), cx, cy)   # a patch stands on its own only well INSIDE the plan:
+        for j in range(1, n + 1):                                       # along an eave the straddling cells hold wall returns,
+            m = lab == j                                                # and a low patch there put a riser fin on every eave
+            if (m.sum() < 8 or not (m & core).any()) and (near[m] >= 0).any():
+                pid[m] = np.bincount(near[m][near[m] >= 0]).argmax(); continue
+            coefs.append((0.0, 0.0, float(np.median(fitted[m])))); pid[m] = len(coefs) - 1
+    # regions: connected cells of one plane
+    regions = []                                      # (plane k, shapely polygon)
+    for k in range(len(coefs)):
+        lab, n = ndi.label(pid == k)
+        for j in range(1, n + 1):
+            rr, cc = np.nonzero(lab == j)
+            g = shapely.unary_union([shapely.box(lo[0] + c * pix, lo[1] + r * pix, lo[0] + (c + 1) * pix, lo[1] + (r + 1) * pix)
+                                     for r, c in zip(rr, cc)]).intersection(plan)
+            for part in (g.geoms if g.geom_type == "MultiPolygon" else [g]):
+                if part.geom_type == "Polygon" and part.area > 1e-6: regions.append([k, part])
+    if not regions: return None
+    # STRAIGHT BOUNDARIES, STILL SHARED. Every region edge into one noded network, each edge between
+    # junctions simplified with its ends fixed, the faces re-formed and given back to the region that
+    # covers most of each — a cell staircase between two levels became a row of riser teeth
+    # (gers_0d3841e4's terraces, 2026-09-07); a straight, shared boundary is one riser.
+    try:
+        from shapely.ops import linemerge, polygonize, unary_union
+        net = unary_union([g.boundary for _, g in regions])
+        merged = linemerge(net) if net.geom_type != "LineString" else net
+        lines = [ln.simplify(0.7 * pix) for ln in (merged.geoms if hasattr(merged, "geoms") else [merged])]
+        faces = list(polygonize(unary_union(lines)))
+        if faces:
+            by_region = {}
+            for f in faces:
+                best = max(range(len(regions)), key=lambda i: regions[i][1].intersection(f).area)
+                if regions[best][1].intersection(f).area <= 0: continue
+                by_region.setdefault(best, []).append(f)
+            rebuilt = []
+            for i, (k, g) in enumerate(regions):
+                if i not in by_region: continue
+                u = unary_union(by_region[i]).intersection(plan)
+                for part in (u.geoms if u.geom_type == "MultiPolygon" else [u]):
+                    if part.geom_type == "Polygon" and part.area > 1e-6: rebuilt.append([k, part])
+            if rebuilt: regions = rebuilt
+    except Exception:
+        pass                                       # the cell-staircase regions stand if the network fails to form
+    # the ridge: a vertex shared by two regions whose planes meet there moves onto their intersection line
+    key = lambda q: (round(q[0], 4), round(q[1], 4))
+    owners = {}
+    for i, (k, g) in enumerate(regions):
+        for ring_ in [g.exterior, *g.interiors]:
+            for q in np.asarray(ring_.coords)[:-1]: owners.setdefault(key(q), set()).add(i)
+    moved = {}
+    for kq, own in owners.items():
+        if len(own) != 2: continue
+        i, j = sorted(own); ki, kj = regions[i][0], regions[j][0]
+        if ki == kj: continue
+        (a1, b1, c1), (a2, b2, c2) = coefs[ki], coefs[kj]
+        da, db, dc = a1 - a2, b1 - b2, c1 - c2; nrm = np.hypot(da, db)
+        if nrm < 1e-6: continue
+        q = np.array(kq); gap = pz(ki, q)[0] - pz(kj, q)[0]
+        if abs(gap) > 0.6: continue                  # they do not meet here: a step, a riser will join them
+        dist = (da * (q[0] - lo[0] - 0.5 * pix) + db * (q[1] - lo[1] - 0.5 * pix) + dc) / nrm
+        if abs(dist) > 1.0 * pix: continue
+        moved[kq] = (q[0] - dist * da / nrm, q[1] - dist * db / nrm)
+    if moved:
+        for reg in regions:
+            k, g = reg
+            def mv(ring_):
+                return [moved.get(key(q), tuple(q)) for q in np.asarray(ring_.coords)[:-1]]
+            pg = Polygon(mv(g.exterior), [mv(h) for h in g.interiors]).buffer(0).intersection(plan)   # a moved vertex never leaves the plan
+            if pg.geom_type == "MultiPolygon": pg = max(pg.geoms, key=lambda a: a.area)
+            if pg.geom_type == "Polygon" and pg.is_valid and pg.area > 1e-6: reg[1] = pg
+    soup = []
+    for k, g in regions:
+        rings = [np.asarray(g.exterior.coords)[:-1]] + [np.asarray(h.coords)[:-1] for h in g.interiors]
+        pts = np.vstack(rings); ends = np.cumsum([len(r) for r in rings]).astype(np.uint32)
+        idx = mapbox_earcut.triangulate_float64(pts, ends).reshape(-1, 3)
+        P3 = np.column_stack([pts, pz(k, pts)])
+        T = P3[idx]
+        flip = np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0])[:, 2] < 0
+        T[flip] = T[flip][:, ::-1]
+        soup.extend(T.reshape(-1, 3))
+    # risers: along a boundary two regions share, where their planes do not meet
+    for i in range(len(regions)):
+        ki, gi = regions[i]
+        for j in range(i + 1, len(regions)):
+            kj, gj = regions[j]
+            if ki == kj: continue
+            shared = gi.boundary.intersection(gj.boundary)
+            if shared.is_empty or shared.length < 1e-6: continue
+            lines = shared.geoms if hasattr(shared, "geoms") else [shared]
+            for ln in lines:
+                if ln.geom_type != "LineString": continue
+                cs = np.asarray(ln.coords)
+                for a, b in zip(cs[:-1], cs[1:]):
+                    za, zb = pz(ki, [a, b]), pz(kj, [a, b])
+                    if max(abs(za[0] - zb[0]), abs(za[1] - zb[1])) < 0.05: continue
+                    soup += [[*a, za[0]], [*b, za[1]], [*b, zb[1]], [*a, za[0]], [*b, zb[1]], [*a, zb[0]]]
+    T = np.asarray(soup, float).reshape(-1, 3, 3)
+    ln = np.linalg.norm(np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]), axis=1)
+    return T[ln > 1e-6].reshape(-1, 3)                  # a sliver at the ridge has no normal to speak of
+
+
+def roof_surface(ring, rim_xy, rim_z, fitted, occ, lo, pix, planes=None, exclude=(), zmin=None):
     """The roof as ONE surface clipped to the outline: a Delaunay triangulation of the wall-top
     samples along the outline (`rim_xy`, `rim_z`, from `tiered_body`) and the fitted heights of the
     cells well inside it, keeping the triangles whose centre lies in the footprint. Roof and walls
@@ -411,6 +635,10 @@ def roof_surface(ring, rim_xy, rim_z, fitted, occ, lo, pix, planes=None, exclude
     gy, gx = np.mgrid[0:fitted.shape[0], 0:fitted.shape[1]]
     cx, cy = lo[0] + (gx + 0.5) * pix, lo[1] + (gy + 0.5) * pix
     inner = occ & shapely.contains_xy(shapely.Polygon(ring).buffer(-0.7 * pix), cx, cy)
+    for ex in exclude:                                     # a tier's cells are ITS roof: below it the surface must not ramp up to them
+        inner &= ~shapely.contains_xy(ex.buffer(0.3 * pix), cx, cy)
+    if zmin is not None:                                   # a tier's roof is the cells AT its level: a cell holding its wall returns dips
+        inner &= fitted >= zmin                            # toward the podium and eroded the tower's rim (gers_003362c0)
     P = np.column_stack([cx[inner], cy[inner], fitted[inner]])
     if planes is not None and len(planes[1]) > 1:
         # A RIDGE IS A LINE, NOT A STAIRCASE. Where two fitted planes meet, the line they meet on is
@@ -419,7 +647,12 @@ def roof_surface(ring, rim_xy, rim_z, fitted, occ, lo, pix, planes=None, exclude
         # points ONTO the line instead left near-duplicates and slivers of missing roof along it.
         from scipy import ndimage as ndi
         pid_all, coefs = planes
-        keep = np.ones(len(P), bool); ridge = []
+        # only the planes with cells IN THIS PLAN, at this roof's level: a plane fitted to a tower's
+        # flank cut the tower's roof plane along a line inside the tower and dragged its surface down
+        here = occ & shapely.contains_xy(shapely.Polygon(ring).buffer(0.2 * pix), cx, cy)
+        if zmin is not None: here &= fitted >= zmin
+        pid_all = np.where(here, pid_all, -1)
+        keep = np.ones(len(P), bool); ridge = []; steps = []
         for i in range(len(coefs)):
             for j in range(i + 1, len(coefs)):
                 mi, mj = pid_all == i, pid_all == j
@@ -428,37 +661,69 @@ def roof_surface(ring, rim_xy, rim_z, fitted, occ, lo, pix, planes=None, exclude
                 (a1, b1, c1), (a2, b2, c2) = coefs[i], coefs[j]
                 da, db, dc = a1 - a2, b1 - b2, c1 - c2
                 nrm = np.hypot(da, db)
-                if nrm < 1e-6: continue
-                # the line in world xy: da*(x - lo0 - .5) + db*(y - lo1 - .5) + dc = 0; direction (-db, da)
-                d = np.array([-db, da]) / nrm
-                p0 = np.array([lo[0] + 0.5 * pix, lo[1] + 0.5 * pix]) - np.array([da, db]) / nrm * (dc / nrm)
                 ty, tx = np.nonzero(touch); txy = np.column_stack([lo[0] + (tx + 0.5) * pix, lo[1] + (ty + 0.5) * pix])
-                t = (txy - p0) @ d
-                for tk in np.arange(t.min() - pix, t.max() + pix, pix):
-                    q = p0 + tk * d
-                    ridge.append([q[0], q[1], plane_z(coefs[i], lo, pix, q[None])[0]])
-                dist = (da * (P[:, 0] - lo[0] - 0.5 * pix) + db * (P[:, 1] - lo[1] - 0.5 * pix) + dc) / nrm
-                t_all = (P[:, :2] - p0) @ d
-                keep &= ~((np.abs(dist) < 0.5 * pix) & (t_all > t.min() - pix) & (t_all < t.max() + pix))
+                gap = plane_z(coefs[i], lo, pix, txy) - plane_z(coefs[j], lo, pix, txy)   # the two planes, at the same points
+                if nrm > 1e-6 and (np.abs(gap).min() < 0.3 or np.sign(gap).min() != np.sign(gap).max()):
+                    # THE PLANES MEET: a ridge / a hip. Its line is sampled along the stretch they touch.
+                    d = np.array([-db, da]) / nrm
+                    p0 = np.array([lo[0] + 0.5 * pix, lo[1] + 0.5 * pix]) - np.array([da, db]) / nrm * (dc / nrm)
+                    t = (txy - p0) @ d
+                    for tk in np.arange(t.min() - pix, t.max() + pix, pix):
+                        q = p0 + tk * d
+                        ridge.append([q[0], q[1], plane_z(coefs[i], lo, pix, q[None])[0]])
+                    dist = (da * (P[:, 0] - lo[0] - 0.5 * pix) + db * (P[:, 1] - lo[1] - 0.5 * pix) + dc) / nrm
+                    t_all = (P[:, :2] - p0) @ d
+                    keep &= ~((np.abs(dist) < 0.5 * pix) & (t_all > t.min() - pix) & (t_all < t.max() + pix))
+                elif np.median(np.abs(gap)) < 2.0:
+                    # THE PLANES DO NOT MEET: a STEP under 2 m (gers_06098c52's flat roof at 4.8, 5.7 and 6.9 m,
+                    # 2026-09-07). A step of 2 m or more is a tier's edge, and the tier builds that wall —
+                    # a riser here straddled the tier's cut line and ramped the podium up to 13 m.
+                    # 2026-09-07). Along the shared cell edges, a point on each side a hand's width
+                    # apart, each at its own plane — the surface between them is the step's riser.
+                    for r, c in zip(ty, tx):
+                        for dr, dc_ in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                            rr, cc = r + dr, c + dc_
+                            if not (0 <= rr < mi.shape[0] and 0 <= cc < mi.shape[1]) or not mi[rr, cc]: continue
+                            mid = np.array([lo[0] + (c + 0.5 + 0.5 * dc_) * pix, lo[1] + (r + 0.5 + 0.5 * dr) * pix])
+                            along = np.array([dr, dc_], float) * pix * 0.5                    # the edge runs across the neighbour direction
+                            for u in (-0.5, 0.0, 0.5):
+                                q = mid + u * np.array([dr, dc_])[::-1] * pix * (1 if dr == 0 else 1)
+                                q = mid + np.array([0.0, u * pix]) if dr == 0 else mid + np.array([u * pix, 0.0])
+                                off = np.array([dc_, dr], float) * 0.05 * pix                 # toward the i side
+                                steps.append([*(q + off), plane_z(coefs[i], lo, pix, (q + off)[None])[0]])
+                                steps.append([*(q - off), plane_z(coefs[j], lo, pix, (q - off)[None])[0]])
+                            near = np.hypot(P[:, 0] - mid[0], P[:, 1] - mid[1]) < 0.55 * pix
+                            keep &= ~near
         P = P[keep]
         if ridge:
             R = np.asarray(ridge)
             R = R[shapely.contains_xy(shapely.Polygon(ring).buffer(-0.3 * pix), R[:, 0], R[:, 1])]
             P = np.vstack([P, R]) if len(R) else P
+        n_step = 0
+        if steps:
+            S = np.unique(np.round(np.asarray(steps), 4), axis=0)
+            S = S[shapely.contains_xy(shapely.Polygon(ring).buffer(-0.3 * pix), S[:, 0], S[:, 1])]
+            n_step = len(S); P = np.vstack([P, S]) if len(S) else P
     pts = np.vstack([P, np.column_stack([rim_xy, rim_z])])
+    is_step = np.zeros(len(pts), bool)
+    if planes is not None and len(planes[1]) > 1 and n_step:
+        is_step[len(P) - n_step:len(P)] = True
     if len(pts) < 3: return np.zeros((0, 3), np.float32)
     try:
         tri = Delaunay(pts[:, :2]).simplices
     except Exception:
         return np.zeros((0, 3), np.float32)
-    cen = pts[tri][:, :, :2].mean(1)
-    keep_t = shapely.contains_xy(shapely.Polygon(ring), cen[:, 0], cen[:, 1])
+    # CLIP, DO NOT CULL. A triangle is kept whole inside the plan, cut to the plan where it crosses
+    # the outline, and gone outside it — so the surface covers the plan exactly and its boundary IS
+    # the outline. Culling by centroid dropped every triangle on a rim sample at a concave corner,
+    # and the sample with it: gers_0112d1b3 lost 20 of 82 and a slot opened at the L's inner corner.
+    plan = shapely.Polygon(ring)
     for ex in exclude:                                     # a tier's plan: ITS roof is built inside it, not here
-        keep_t &= ~shapely.contains_xy(ex, cen[:, 0], cen[:, 1])
-    T = pts[tri[keep_t]]
-    nrm = np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]); ln = np.linalg.norm(nrm, axis=1)
-    T = T[(ln > 1e-4) & (np.abs(nrm[:, 2]) > 0.3 * ln)]  # not the slivers between rim and hull, and not a wall: a roof
-                                                           # triangle that bridges a tier step is the tier's wall's job
+        plan = plan.difference(ex)
+    T = clip_surface(plan, pts[tri])
+    if not len(T): return np.zeros((0, 3), np.float32)
+    ln = np.linalg.norm(np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0]), axis=1)
+    T = T[ln > 1e-4]
     flip = np.cross(T[:, 1] - T[:, 0], T[:, 2] - T[:, 0])[:, 2] < 0
     T[flip] = T[flip][:, ::-1]
     return T.reshape(-1, 3)                          # float64: in UTM, float32 resolves 0.5 m of northing
@@ -470,7 +735,126 @@ def plane_z(coef, lo, pix, xy):
     return a * (xy[:, 0] - lo[0] - 0.5 * pix) + b * (xy[:, 1] - lo[1] - 0.5 * pix) + c
 
 
-def tiered_body(ring, fitted, occ, lo, pix, z0, step=2.0, low=None, planes=None):
+def survey_plan(ring, dense, lo, pix, snap=0.75, reach=1.5, min_area=10.0, neighbours=()):
+    """The building's plan from the cells that hold its returns (`dense`, a bool grid on the
+    `top_surface` grid), within `reach` of the footprint `ring`; vertices within `snap` of the
+    footprint snap onto it. -> [(n, 2) rings], the footprint itself when nothing survives."""
+    import shapely
+    from scipy import ndimage as ndi
+    from shapely.geometry import Polygon, Point
+    foot = Polygon(np.asarray(ring, float))
+    nb = ndi.convolve(dense.astype(int), np.ones((3, 3), int), mode="constant") - dense
+    dense = dense & (nb >= 2)                            # a stray has no company; a corner cell has three neighbours and stays
+    rr, cc = np.nonzero(dense)
+    if len(rr) < 4: return [np.asarray(ring, float)]
+    region = shapely.unary_union([shapely.box(lo[0] + c * pix, lo[1] + r * pix, lo[0] + (c + 1) * pix, lo[1] + (r + 1) * pix)
+                                  for r, c in zip(rr, cc)]).simplify(0.8 * pix).intersection(foot.buffer(reach))   # 0.8: a cell staircase
+    for nb in neighbours:                                                                                    # goes, a corner (0.999 off its chord) stays                                  # a neighbour's footprint is the neighbour's: the plan stops there
+        region = region.difference(Polygon(np.asarray(nb, float)))
+    out = []
+    for g in (region.geoms if region.geom_type == "MultiPolygon" else [region]):
+        if g.geom_type != "Polygon" or g.area < min_area: continue
+        pts = []
+        for q in np.asarray(g.exterior.coords)[:-1]:
+            P = Point(*q)
+            if foot.exterior.distance(P) <= snap:
+                n = foot.exterior.interpolate(foot.exterior.project(P)); pts.append([n.x, n.y])
+            else: pts.append(list(q))
+        pg = Polygon(pts).buffer(0)
+        if pg.geom_type == "MultiPolygon": pg = max(pg.geoms, key=lambda a: a.area)
+        if pg.is_valid and pg.area >= min_area:
+            out.append(np.asarray(pg.simplify(0.3 * pix).exterior.coords)[:-1])
+    return out or [np.asarray(ring, float)]
+
+
+def survey_outline(ring, x, y, z, pix=1.0, neighbours=(), reach=1.5, cell=0.5, min_n=2):
+    """The outline the RETURNS draw for a building, to set beside the map's footprint.
+
+    1. The building's returns within `reach` m of the footprint `ring` and outside every neighbour's.
+    2. A `cell` m grid; a cell is occupied when `min_n` returns land in it (one let a stray count).
+    3. Close one-cell gaps (3 x 3), fill holes, open away single cells (2 x 2); the largest region.
+    4. Its contour (the 0.5 iso-line of the grid), simplified at the cell size, pulled in by a
+       quarter cell — the contour runs along the outer edges of occupied cells, the returns lie
+       inside them (2026-09-07, gers_0112d1b3: the line stood half a metre off the returns).
+    -> [(n, 2) rings]."""
+    import shapely
+    from scipy import ndimage as ndi
+    from shapely.geometry import Polygon
+    from skimage import measure
+    foot = Polygon(np.asarray(ring, float))
+    keep = shapely.contains_xy(foot.buffer(reach), x, y)
+    for nb in neighbours:
+        keep &= ~shapely.contains_xy(Polygon(np.asarray(nb, float)), x, y)
+    if keep.sum() < 20: return []
+    xs, ys = np.asarray(x, float)[keep], np.asarray(y, float)[keep]
+    x0, y0 = xs.min() - cell, ys.min() - cell
+    gx = ((xs - x0) / cell).astype(int); gy = ((ys - y0) / cell).astype(int)
+    cnt = np.zeros((gy.max() + 2, gx.max() + 2), int); np.add.at(cnt, (gy, gx), 1)
+    m = cnt >= min_n
+    m = ndi.binary_closing(m, np.ones((3, 3))); m = ndi.binary_fill_holes(m); m = ndi.binary_opening(m, np.ones((2, 2)))
+    lb, nl = ndi.label(m)
+    if nl == 0: return []
+    m = lb == np.argmax(np.bincount(lb.ravel())[1:]) + 1
+    cont = measure.find_contours(np.pad(m, 1).astype(float), 0.5)
+    if not cont: return []
+    c = max(cont, key=len)
+    pg = Polygon(np.column_stack([x0 + (c[:, 1] - 1) * cell, y0 + (c[:, 0] - 1) * cell])).simplify(cell).buffer(-0.25 * cell)
+    if pg.is_empty: return []
+    pg = pg.intersection(foot.buffer(reach))
+    return [np.asarray(g.exterior.coords)[:-1] for g in (pg.geoms if pg.geom_type == "MultiPolygon" else [pg]) if g.geom_type == "Polygon" and g.area >= 10]
+
+
+def survey_footprint(ring, outline, band=2.5, min_pts=8, step=0.25):
+    """The Overture footprint CORRECTED by the survey: every edge of `ring` kept, each moved sideways
+    to where the returns' boundary lies beside it, the corners re-formed where the moved edges meet.
+
+    1. The returns' boundary is the traced `outline` (from `survey_outline`), densified to a point
+       every `step` m.
+    2. For each edge of the footprint: the boundary points that project onto the edge (within 1 m
+       past either end) and lie within `band` m of its line, on either side. Their median signed
+       distance from the line is the edge's offset; with fewer than `min_pts` such points the edge
+       stays where the map put it.
+    3. The edge's line is shifted by that offset. Two consecutive shifted lines meet at the new
+       corner; where they are within 10 degrees of parallel (a zigzag of short edges all moved onto
+       one wall), the corner is the shifted edge's own end point.
+    4. The result is kept only if it is a valid polygon; otherwise the footprint stays as it was.
+
+    -> (n, 2) ring. The edges' bearings are the map's, their positions the survey's.
+    """
+    from shapely.geometry import Polygon, LineString
+    R = np.asarray(ring, float); n = len(R)
+    ol = LineString(np.vstack([np.asarray(outline, float), np.asarray(outline, float)[:1]]))
+    B = np.asarray([ol.interpolate(t).coords[0] for t in np.arange(0.0, ol.length, step)])
+    poly = Polygon(R); ccw = poly.exterior.is_ccw
+    lines = []
+    for i in range(n):
+        a, b = R[i], R[(i + 1) % n]; d = b - a; L = np.linalg.norm(d)
+        if L < 1e-6: lines.append((a, b)); continue
+        u = d / L; nrm = np.array([-u[1], u[0]]) * (-1.0 if ccw else 1.0)     # outward
+        t = (B - a) @ u; s_ = (B - a) @ nrm
+        sel = (t >= -1.0) & (t <= L + 1.0) & (np.abs(s_) <= band)
+        off = float(np.median(s_[sel])) if sel.sum() >= min_pts else 0.0
+        lines.append((a + off * nrm, b + off * nrm))
+    out = []
+    for i in range(n):
+        (a1, b1), (a2, b2) = lines[i - 1], lines[i]
+        d1, d2 = b1 - a1, b2 - a2
+        cross = d1[0] * d2[1] - d1[1] * d2[0]
+        n1, n2 = np.linalg.norm(d1), np.linalg.norm(d2)
+        if n1 < 1e-6 or n2 < 1e-6 or abs(cross) < n1 * n2 * np.sin(np.radians(10)):
+            out.append(a2)                                             # near-parallel: the edge's own moved end
+        else:
+            t = ((a2 - a1)[0] * d2[1] - (a2 - a1)[1] * d2[0]) / cross
+            q = a1 + t * d1
+            out.append(q if np.all(np.isfinite(q)) and np.linalg.norm(q - a2) < 5.0 else a2)   # a corner cannot run off
+    pg = Polygon(out).buffer(0)
+    if pg.geom_type == "MultiPolygon": pg = max(pg.geoms, key=lambda g: g.area)
+    if not pg.is_valid or pg.geom_type != "Polygon" or pg.area < 0.5 * poly.area or pg.area > 2.0 * poly.area:
+        return R
+    return np.asarray(pg.exterior.coords)[:-1]
+
+
+def tiered_body(ring, fitted, occ, lo, pix, z0, step=2.0, low=None, planes=None, wallcell=None):
     """The walls of a building whose roof is not one level: the outline's, and each tier's own.
 
     ``footprint_prism`` extrudes the outline to ONE top. A podium with a tower over its middle
@@ -512,6 +896,11 @@ def tiered_body(ring, fitted, occ, lo, pix, z0, step=2.0, low=None, planes=None)
 
     # the rim: every `pix` along each edge, the roof height there
     inner = occ & shapely.contains_xy(shapely.Polygon(ring).buffer(-0.7 * pix), cx, cy)
+    # the outline wall stops at the BASE level: where a tier stands flush with the outline its own
+    # wall covers the rest, and sampling tier cells here made a comb of tall and short quads along
+    # gers_003362c0's north face
+    hgt0 = fitted if low is None else low
+    inner &= ~(hgt0 > base + step)
     if inner.sum() < 2: inner = occ
     tree = cKDTree(np.column_stack([cx[inner], cy[inner]]))
     h_in = fitted[inner]
@@ -554,7 +943,7 @@ def tiered_body(ring, fitted, occ, lo, pix, z0, step=2.0, low=None, planes=None)
         return out
 
     ccw = shapely.Polygon(ring).exterior.is_ccw
-    hgt = fitted if low is None else low
+    hgt = fitted                                     # wall cells already took their lower quartile upstream
     found = []
 
     def level(hh):
@@ -562,38 +951,51 @@ def tiered_body(ring, fitted, occ, lo, pix, z0, step=2.0, low=None, planes=None)
         (The plant room on gers_003362c0's tower is 15 % of the tower's cells and 4 m above it;
         a plain P98 made IT the tower's top and the tower lost its walls.)"""
         cnt, edges = np.histogram(hh, np.arange(np.floor(hh.min()), hh.max() + 1.0, 1.0))
-        top_bin = np.nonzero(cnt >= 0.25 * len(hh))[0][-1]
+        hit = np.nonzero(cnt >= 0.25 * len(hh))[0]
+        if not len(hit): return float(np.percentile(hh, 98))          # a flat region in one bin
+        top_bin = hit[-1]
         on = hh[(hh >= edges[top_bin] - 1.0) & (hh < edges[top_bin + 1] + 1.0)]
         return float(np.percentile(on, 98))
 
-    def tiers(within, base):
-        """Every region of `within` standing `step` above `base`: its walls, then ITS tiers."""
-        lab, k = ndi.label(within & (hgt > base + step))
+    # A TIER IS A LEVEL THAT STEPS DOWN TO ITS NEIGHBOURS — wherever it stands. Levels are taken
+    # from the top down, 1 m at a time; the cells at a level form regions, and a region is a tier
+    # when cells `step` lower border it. Its walls run from the ground (hidden inside whatever
+    # stands below) to its own level. One base height for the whole building failed a terraced
+    # block (gers_0d3841e4: west side 28 m, terrace side 4 m, "base" 12.5 m — the terraces
+    # below it could never be tiers and the roof draped over them, 2026-09-07).
+    covered = np.zeros_like(occ)
+    measured = occ & np.isfinite(hgt)                # a cell the occupancy closed over but no return landed in has no level
+    hv = hgt[measured]
+    for L in (np.arange(np.floor(hv.max()), np.floor(hv.min()) - 1.0, -1.0) if len(hv) else []):
+        at = measured & ~covered & (np.abs(hgt - L) <= 1.5)   # the cells AT the level: 3 m below swept gers_0d3841e4's
+                                                              # sloping block end into the block
+        lab, k = ndi.label(at)
         for j in range(1, k + 1):
             m = lab == j
-            if m.sum() < 4: continue
-            # A TIER STANDS ON A STEP. The ridge zone of a gable is also 2 m above the eaves, and got
-            # walls from the eave line up through the roof (gers_0112d1b3, 2026-09-07): so the region
-            # must be `step` above the cells just OUTSIDE it, across its own boundary, not above the eaves.
+            if m.sum() < 10: continue                    # a tier has a footprint; four cells are a stair bulkhead or a stray
             around = ndi.binary_dilation(m) & ~m & occ
-            edge = m & ~ndi.binary_erosion(m)
-            if around.any() and np.median(fitted[edge]) - np.median(fitted[around]) < step: continue
-            top = level(fitted[m])
-            m = m & (hgt >= top - 3.0)                  # the tier's plan: cells whose returns lie AT its roof
-            if m.sum() < 4: continue
+            lower = around & (hgt < np.median(hgt[m]) - step)
+            if not around.any() or lower.sum() < 0.25 * around.sum(): continue   # no step down: a slope, or the base itself
+            if (np.abs(fitted[m] - np.median(fitted[m])) <= 0.75).mean() < 0.7: continue   # a tier is FLAT (most cells at its level;
+                                                                                             # a low rim is fine): a gable block is not
+            if wallcell is not None and wallcell[m].mean() > 0.8: continue   # ...and a ROOF: a scrap of wall cells on a tower's flank,
+            top = level(fitted[m])                                            # flat by accident, is not (five such crags on gers_003362c0)
             rr, cc = np.nonzero(m)
             region = shapely.unary_union([shapely.box(lo[0] + c * pix, lo[1] + r * pix, lo[0] + (c + 1) * pix, lo[1] + (r + 1) * pix)
-                                          for r, c in zip(rr, cc)]).simplify(0.8 * pix)   # a 45-degree staircase of cells deviates 0.7 from its line
+                                          for r, c in zip(rr, cc)]).simplify(1.2 * pix)   # a staircase of cells deviates 0.7 from its line; two-cell steps 1.0
             for pg in (region.geoms if region.geom_type == "MultiPolygon" else [region]):
-                if pg.area < 4 * pix * pix: continue
+                if pg.area < 8 * pix * pix: continue
                 mrr = pg.minimum_rotated_rectangle
-                if pg.area >= 0.85 * mrr.area: pg = mrr             # a compact tier is a rectangle, not a staircase of cells
+                if pg.area >= 0.95 * mrr.area: pg = mrr             # only a tier that IS a rectangle becomes one (0.85 squared off a rounded block end)
+                # traced from cell centres, a tier stops half a cell short of the outline it stands on,
+                # leaving a groove of low roof between them (gers_0dccf0d5): grown by that half cell and
+                # cut to the plan, a tier at the outline reaches it, and never passes it
+                pg = pg.buffer(0.55 * pix, join_style=2).intersection(shapely.Polygon(ring))
+                if pg.geom_type != "Polygon" or pg.area < 8 * pix * pix: continue
                 if pg.exterior.is_ccw != ccw: pg = shapely.reverse(pg)
-                soup.extend(walls(np.asarray(pg.exterior.coords)[:-1], base, top))
-                found.append((pg, base, top))
-            tiers(m, top)
-
-    tiers(occ, base)
+                soup.extend(walls(np.asarray(pg.exterior.coords)[:-1], z0, top))
+                found.append((pg, z0, top))
+            covered |= m
     return [np.asarray(w, float) for w in soup], rim_xy, rz, found
 
 
@@ -1046,7 +1448,7 @@ def _tint(soup, col, default):
 # ---- structure -----------------------------------------------------------
 
 def building_model(ring, z0, ztop, col=None, mesh=None,
-                   x=None, y=None, z=None, pix=1.0):
+                   x=None, y=None, z=None, pix=1.0, neighbours=()):
     """A BUILDING: a closed envelope from the ground to its measured roof.
 
     Light stops at a house — every face of it — so the kind is ``solid``, and
@@ -1131,6 +1533,23 @@ def building_model(ring, z0, ztop, col=None, mesh=None,
             # (gers_0112d1b3's wing, 3 returns per cell under a tree, had a 7.5 m "roof" from one stray.)
             from scipy import ndimage as _ndi
             q75 = cell_quantile(x, y, z, lo, top.shape, pix, 0.75, min_n=3)
+            q25 = cell_quantile(x, y, z, lo, top.shape, pix, 0.25, min_n=3)
+            # a cell whose returns spread over metres holds a WALL (the tower's, over the podium roof):
+            # its roof is the bottom of that spread, not the top — by the top, the cells around
+            # gers_003362c0's tower became flat patches of "roof" at 20-35 m, ledges stacked up its faces
+            wall_cell = np.isfinite(q75) & ((q75 - q25) > 1.5)
+            # A CELL WHOSE RETURNS SPREAD OVER METRES HOLDS A WALL — which wall decides its roof:
+            #   at the outline it is the building's own facade under the eave, and the cell's roof is
+            #   the top of the spread (its lower quartile made a 2.7 m band round gers_0112d1b3's
+            #   4-5 m gable and a riser fin on every eave);
+            #   inside the plan it is a step between two levels, and the cell belongs to the LOWER one
+            #   (filled from the nearest roof cell instead, gers_0d3841e4's terraces all became the
+            #   28 m block beside them, 2026-09-07).
+            gy_, gx_ = np.mgrid[0:top.shape[0], 0:top.shape[1]]
+            import shapely as _shp
+            at_edge = ~_shp.contains_xy(_shp.Polygon(np.asarray(ring, float)).buffer(-0.7 * pix),
+                                        lo[0] + (gx_ + 0.5) * pix, lo[1] + (gy_ + 0.5) * pix)
+            q75 = np.where(wall_cell & ~at_edge, q25, q75)
             if np.isfinite(q75).any():
                 ii = _ndi.distance_transform_edt(~np.isfinite(q75), return_distances=False, return_indices=True)
                 top = q75[tuple(ii)]
@@ -1138,6 +1557,18 @@ def building_model(ring, z0, ztop, col=None, mesh=None,
             from scipy import ndimage as _ndi
             loose = pid < 0                                          # cells no plane claims: a median over 3 x 3 takes the spikes out
             fitted = np.where(loose, _ndi.median_filter(fitted, size=3), fitted)
+            if coefs and (loose & occ).any():
+                # ...and one within a metre of the nearest plane lies ON it: the lumps between the
+                # snapped cells of a slope are the same roof, seen through noise
+                gy_, gx_ = np.mgrid[0:top.shape[0], 0:top.shape[1]]
+                ii = _ndi.distance_transform_edt(pid < 0, return_distances=False, return_indices=True)
+                near_pid = pid[tuple(ii)]
+                for k, coef in enumerate(coefs):
+                    cells = loose & occ & (near_pid == k)
+                    if not cells.any(): continue
+                    zpl = coef[0] * gx_[cells] * pix + coef[1] * gy_[cells] * pix + coef[2]
+                    on = np.abs(fitted[cells] - zpl) <= 1.0
+                    idx = np.nonzero(cells); fitted[idx[0][on], idx[1][on]] = zpl[on]; pid[idx[0][on], idx[1][on]] = k
             planes = (pid, coefs)
             gy, gx = np.mgrid[0:top.shape[0], 0:top.shape[1]]
             occ = occ & shapely.contains_xy(
@@ -1152,23 +1583,65 @@ def building_model(ring, z0, ztop, col=None, mesh=None,
                 # The prism gives the true wall planes; the fitted cells ride on top as the
                 # roof only, which is the same division the roofer branch above makes.
                 low = cell_quantile(x, y, z, lo, top.shape, pix)
-                body, rim_xy, rim_z, tiers = tiered_body(ring, fitted, occ, lo, pix, z0, low=low, planes=planes)   # each edge to ITS roof; tiers get their own walls
                 fz = np.maximum(fitted, z0 + 0.05)
-                # THE ROOF, ONE LEVEL AT A TIME: the outline's, with every tier's plan cut out, then each
-                # tier's inside its plan — one triangulation over both would bridge the step with
-                # near-vertical triangles, which read as a ribbed skirt around the tower (gers_003362c0)
-                roof = roof_surface(ring, rim_xy, rim_z, fz, occ, lo, pix, planes=planes, exclude=[t[0] for t in tiers])
-                for pg, tbase, ttop in tiers:
-                    r = np.asarray(pg.exterior.coords)[:-1]
-                    rim, seen = [], set()
-                    for k in range(len(r)):
-                        a, b = r[k], r[(k + 1) % len(r)]
-                        for q in a + np.linspace(0, 1, max(1, int(np.ceil(np.hypot(*(b - a)) / pix))), endpoint=False)[:, None] * (b - a):
-                            rim.append(q)
-                    rim = np.asarray(rim)
-                    inside = [t[0] for t in tiers if t[0] is not pg and pg.contains(t[0])]      # a tier's own tiers
-                    tier_roof = roof_surface(r, rim, np.full(len(rim), ttop), fz, occ, lo, pix, planes=planes, exclude=inside)
-                    if len(tier_roof): roof = np.vstack([roof, tier_roof]) if len(roof) else tier_roof
+                # THE SURVEY OWNS THE PLAN; THE MAP OWNS ITS STRAIGHT LINES. On Granville Island the
+                # Overture footprints are wrong against the returns on half the buildings (2026-09-07):
+                # gers_058f8092 and gers_060510c2 are small rectangles inside buildings three times
+                # their size, gers_00ba2bb9 and gers_0362696a sit two metres off, gers_0dccf0d5 has a
+                # zigzag where the wall is straight, gers_0b9fca8a's east half is empty ground. So the
+                # plan is traced from the cells with returns, within 1.5 m of the footprint, and every
+                # vertex within 0.75 m of the footprint snaps onto it — the footprint's clean edges
+                # where the survey agrees with them, the survey's edge where it does not.
+                # `neighbours` are the footprints around this one: the plan never enters them
+                # THE PLAN IS THE OVERTURE FOOTPRINT, EXACTLY (Kaveh, 2026-09-07: a model whose footprint does
+                # not fit the map's is wasted). The survey decides what stands on it — planes, tiers,
+                # heights. `survey_plan` remains for a caller who wants the returns' own outline instead.
+                plans = [np.asarray(ring, float)]
+                body, roof = [], np.zeros((0, 3))
+                for plan in plans:
+                    in_plan = occ & shapely.contains_xy(shapely.Polygon(plan), lo[0] + (gx + 0.5) * pix, lo[1] + (gy + 0.5) * pix)
+                    if in_plan.sum() < 4: continue
+                    _walls, rim_xy, rim_z, tiers = tiered_body(plan, fitted, in_plan, lo, pix, z0, low=low, planes=planes, wallcell=wall_cell)   # the rim's heights, and the tiers
+                    # (Plane regions alone, with risers for every step, were tried instead of tiers: cell-for-cell
+                    # faithful, but the terraces of gers_0d3841e4 read as irregular patches — Kaveh, 2026-09-07:
+                    # worse. A tier is a level with one plan and one wall; that is what a terrace looks like.)
+                    # THE ROOF, ONE LEVEL AT A TIME: the outline's, with every tier's plan cut out, then each
+                    # tier's inside its plan — one triangulation over both would bridge the step with
+                    # near-vertical triangles, which read as a ribbed skirt around the tower (gers_003362c0)
+                    # a cell whose height jumps metres from its neighbours' is no roof: the cells beside a
+                    # tower that hold its balcony slabs (20-37 m, a tight spread each) wrapped the podium
+                    # roof in a jagged collar (gers_003362c0, 2026-09-07). The rim and the tiers stay.
+                    rough = np.abs(fitted - _ndi.median_filter(fitted, size=3)) > 1.5
+                    # ...and the base surface cannot stand higher than its own rim by more than a roof's
+                    # rise: what does is a tier (built apart) or the collar of a tier's wall returns
+                    lid = (np.median(rim_z) + 4.0) if len(rim_z) else np.inf   # the median: a tier flush with the outline lifts the rim's tail
+                    r0 = planar_roof(plan, fitted, in_plan, lo, pix, planes) if coefs else None
+                    if r0 is None or not len(r0): rim_z = np.minimum(rim_z, lid)   # the fallback surface needs the lid; the planes do not
+                    if r0 is None or not len(r0):
+                        r0 = roof_surface(plan, rim_xy, rim_z, fz, in_plan & ~rough & (fitted <= lid), lo, pix, planes=planes, exclude=[t[0] for t in tiers])
+                    if len(r0):
+                        roof = np.vstack([roof, r0])
+                        # THE WALLS STAND ON THE PLAN'S EDGES AT THE ROOF'S OWN HEIGHT THERE — so they cannot disagree with it.
+                        # The plan is the one the roof was clipped to, tiers cut out: where a tower stands flush with
+                        # the outline the podium's wall stops at the podium (its roof has no height under the tower)
+                        base_plan = shapely.Polygon(plan)
+                        for t in tiers: base_plan = base_plan.difference(t[0])
+                        for part in (base_plan.geoms if base_plan.geom_type == "MultiPolygon" else [base_plan]):
+                            if part.geom_type == "Polygon" and part.area > 1.0:
+                                body += plan_walls(part, r0.reshape(-1, 3, 3), z0, pix)
+                    for pg, tbase, ttop in tiers:
+                        r = np.asarray(pg.exterior.coords)[:-1]
+                        rim = []
+                        for k in range(len(r)):
+                            a, b = r[k], r[(k + 1) % len(r)]
+                            for q in a + np.linspace(0, 1, max(1, int(np.ceil(np.hypot(*(b - a)) / pix))), endpoint=False)[:, None] * (b - a):
+                                rim.append(q)
+                        rim = np.asarray(rim)
+                        inside = [t[0] for t in tiers if t[0] is not pg and pg.contains(t[0])]      # a tier's own tiers
+                        tier_roof = roof_surface(r, rim, np.full(len(rim), ttop), fz, in_plan, lo, pix, planes=planes, exclude=inside, zmin=ttop - 3.0)
+                        if len(tier_roof):
+                            roof = np.vstack([roof, tier_roof])
+                            body += plan_walls(pg, tier_roof.reshape(-1, 3, 3), z0, pix)
                 if len(body):
                     # float64, not the float32 the other recipes use: these are UTM metres, and at a
                     # northing of 5.4 million float32 quantises to 0.5 m — every rim, ridge and eave

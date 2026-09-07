@@ -46,6 +46,10 @@ def collect(root, only=(), max_points=MAX_POINTS, log=print):
         meta = json.loads((d / "meta.json").read_text()) if (d / "meta.json").is_file() else {}
         ox, oy, oz = meta.get("origin_utm", (0, 0, 0))
         b = dict(id=d.name, name=meta.get("name", d.name), level=meta.get("level", "?"), built=meta.get("built", ""),
+                 footprint=[[q[0] - ox, q[1] - oy] for q in meta.get("footprint", [])],
+                 survey_outline=[[[q[0] - ox, q[1] - oy] for q in r] for r in meta.get("survey_outline", [])],
+                 survey_footprint=[[q[0] - ox, q[1] - oy] for q in meta.get("survey_footprint", [])],
+                 iou=meta.get("footprint_iou"), area=meta.get("footprint_area"), sarea=meta.get("survey_footprint_area"),
                  glb=base64.b64encode(glb.read_bytes()).decode(), photos=[], points=None, npts=0,
                  walls=[dict(id=f["id"], w=f["w"], h=f["h"], facing=f["facing"], method=f.get("method", ""),
                              filled=f.get("filled", 0), elements=len(f.get("elements", [])))
@@ -130,6 +134,7 @@ label{font-size:12px;color:var(--muted);margin-left:12px}
    <label><input type="checkbox" id="wire"> wireframe</label>
    <label><input type="checkbox" id="cams" checked> cameras</label></h2><canvas id="cmodel"></canvas></div>
 </div>
+<div class="strip"><h2>Plan <span style="color:var(--muted);font-weight:400">— the returns from above; <span style="color:#d81b60">red</span> the Overture footprint (what the model is built on), <span style="color:#1e88e5">blue</span> the outline the returns draw, <span style="color:#2e7d32">green</span> the proposed footprint made from it (docs/footprints.md)</span> <span id="planinfo" style="color:var(--muted);font-weight:400"></span></h2><canvas id="cplan" style="width:100%;height:520px;display:block;background:#fff;border-radius:8px"></canvas></div>
 <div class="strip"><h2>Walls</h2><div id="walls"></div></div>
 <div class="strip"><h2>Photos <span style="color:var(--muted);font-weight:400">— click one to see it large and mark its camera in the model; faded ones were not used</span></h2>
  <div class="gallery" id="gallery"></div></div>
@@ -139,15 +144,19 @@ label{font-size:12px;color:var(--muted);margin-left:12px}
 const B = %DATA%;
 const GEN = "%GEN%";
 const bin = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
+// ONE camera for both panels: orbit either, and the returns and the model stay at the same angle,
+// so what differs between them is the building, never the view
+const cam = new THREE.PerspectiveCamera(45, 1, 0.5, 3000); cam.position.set(38, 24, 42);
+const ctl = new THREE.OrbitControls(cam, document.getElementById("cmodel")); ctl.target.set(0, 5, 0);
+for (const t of ["pointerdown", "pointermove", "pointerup", "pointercancel", "wheel", "contextmenu"])   // orbit from the points panel too
+  document.getElementById("cpts").addEventListener(t, e => { document.getElementById("cmodel").dispatchEvent(new e.constructor(e.type, e)); if (t === "wheel" || t === "contextmenu") e.preventDefault(); }, {passive: false});
 function view(canvas){
   const r = new THREE.WebGLRenderer({canvas, antialias:true}); r.setPixelRatio(devicePixelRatio); r.outputEncoding = THREE.sRGBEncoding;
   const scene = new THREE.Scene(); scene.background = new THREE.Color(0xe9eef2);
-  const cam = new THREE.PerspectiveCamera(45, 1, 0.5, 3000); cam.position.set(38, 24, 42);
   scene.add(new THREE.HemisphereLight(0xffffff, 0x8899aa, 0.85));
   const sun = new THREE.DirectionalLight(0xffffff, 0.6); sun.position.set(-40, 80, 30); scene.add(sun);
   const g = new THREE.Mesh(new THREE.PlaneGeometry(600, 600), new THREE.MeshLambertMaterial({color:0xd7d2c4}));
   g.rotation.x = -Math.PI/2; g.position.y = -0.05; scene.add(g);
-  const ctl = new THREE.OrbitControls(cam, canvas); ctl.target.set(0, 5, 0);
   const frame = obj => {                       // sit the camera where the whole building fits
     const bb = new THREE.Box3().setFromObject(obj); if (bb.isEmpty()) return;
     const c = bb.getCenter(new THREE.Vector3()), s = bb.getSize(new THREE.Vector3());
@@ -179,10 +188,33 @@ function show(b){
     const pc = new THREE.Points(geo, new THREE.PointsMaterial({size:0.16, vertexColors:true}));
     P.scene.add(pc); P.frame(pc);
   }
+  // plan: returns from above, both outlines
+  try { (function(){
+    const c = document.getElementById("cplan"), g = c.getContext("2d"); c.width = c.clientWidth * devicePixelRatio; c.height = c.clientHeight * devicePixelRatio;
+    g.setTransform(devicePixelRatio, 0, 0, devicePixelRatio, 0, 0); g.clearRect(0, 0, c.clientWidth, c.clientHeight);
+    const rings = [b.footprint, b.survey_footprint, ...b.survey_outline].filter(r => r && r.length);
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity, n = 0;   // a loop: spreading 150 000 points into
+    const take = (x, y) => { if (x < x0) x0 = x; if (x > x1) x1 = x; if (y < y0) y0 = y; if (y > y1) y1 = y; n++; };   // Math.min blew the stack
+    rings.forEach(r => r.forEach(q => take(q[0], q[1])));
+    let pos = b.points ? new Float32Array(bin(b.points).buffer) : null;
+    if (pos) for (let i = 0; i < pos.length; i += 3) take(pos[i], -pos[i + 2]);
+    if (!n) return;
+    const W = c.clientWidth, H = c.clientHeight, s = Math.min((W - 40) / (x1 - x0 + 1e-6), (H - 40) / (y1 - y0 + 1e-6));
+    const X = x => 20 + (x - x0) * s, Y = y => H - 20 - (y - y0) * s;
+    if (pos) { g.fillStyle = "#9aa4ad"; for (let i = 0; i < pos.length; i += 3) g.fillRect(X(pos[i]) - 0.6, Y(-pos[i + 2]) - 0.6, 1.2, 1.2); }
+    const draw = (r, col) => { g.beginPath(); r.forEach((q, i) => i ? g.lineTo(X(q[0]), Y(q[1])) : g.moveTo(X(q[0]), Y(q[1]))); g.closePath(); g.strokeStyle = col; g.lineWidth = 2; g.stroke(); };
+    b.survey_outline.forEach(r => draw(r, "#1e88e5"));
+    if (b.survey_footprint.length) draw(b.survey_footprint, "#2e7d32");
+    if (b.footprint.length) draw(b.footprint, "#d81b60");
+    document.getElementById("planinfo").textContent = b.iou == null ? "" : `· Overture ${b.area} m², proposed ${b.sarea} m², overlap (IoU) ${(b.iou * 100).toFixed(0)} %`;
+    g.fillStyle = "#333"; g.font = "12px system-ui"; g.fillText(`${((x1 - x0)).toFixed(0)} m across`, 20, 14);
+  })(); } catch (e) { console.error("plan panel", e); }
   // model
   M.clear(); model = null; marks = {};
   document.getElementById("mdlinfo").textContent = `${(b.glb.length * 3 / 4 / 1024) | 0} KB`;
+  const token = (show.token = (show.token || 0) + 1);            // a model that finishes loading after the next pick is dropped
   new THREE.GLTFLoader().parse(bin(b.glb).buffer, "", g => {
+    if (token !== show.token) return;
     model = g.scene; model.traverse(o => { if (o.material && o.material.map) o.material.map.encoding = THREE.sRGBEncoding; });
     M.scene.add(model); M.frame(model); wire();
   });

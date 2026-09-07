@@ -58,7 +58,7 @@ class Building:
 def building3d(footprint, *, store=None, points=None, photos=None, masks=None, elements=None,
                solid=None, solids=(), out=None, level="joinery", name="building",
                labels=None, indoor=(), clicks=None, z_ground=None, compose=True,
-               qa=True, write=True, root=None, log=print):
+               qa=True, write=True, root=None, log=print, neighbours=()):
     """A textured 3-D building. `footprint` is a ring, a shapely polygon, or a points npz.
 
     store       point store for `dl.read` (a parquet path, a LAS/LAZ, or a list of tiles)
@@ -75,6 +75,7 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
     indoor      photo indices to skip (indoor photospheres); the manifest's `unused` flag also skips
     root        base for RELATIVE photo paths in the manifest (default the working directory);
                 absolute paths, which is what the fetchers write, ignore it
+    neighbours  rings of the footprints around this one: the plan traced from the returns stops at them
     """
     from . import facade, glb
     from .building import camera, geometry, points as pts_mod, walls as wl
@@ -90,6 +91,8 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
 
     # ---- points: the building's own returns, and the ground it stands on -------------------
     d = _points(footprint, points, store, labels, pts_mod)
+    if len(d["z"]) < 20:
+        raise ValueError("no building returns inside the footprint: the survey does not show a building here")
     P = np.column_stack([d["x"], d["y"], d["z"]]); rgb = np.asarray(d["rgb"], float)
     ring = np.asarray(d["ring"])
     measured = z_ground if z_ground is not None else d.get("z_ground")
@@ -99,7 +102,7 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
 
     # ---- geometry: the solid, its facades, its outer edges ---------------------------------
     V, T = (geometry.load_solid(solid, solids) if solid is not None
-            else fallback_solid(ring, P, zg))
+            else fallback_solid(ring, P, zg, neighbours=neighbours))
     n = geometry.normals(V, T); centre = V.mean(0)
     F = geometry.facades(V, T, n, centre); E = geometry.outer_edges(F)
     SOLID = dict(V=V, T=T)
@@ -189,7 +192,15 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
                           (bbox[3] - V[vid, 1]) / (bbox[3] - bbox[1])])
     prims.append(dict(pos=V[vid], uv=uv, idx=remap[T[roof]], tex=rtex, name="roof_lidar"))
     for j, b in enumerate(boxes): prims.append(geometry.box_prim(b, f"skylight{j:02d}"))
-    prims.append(geometry.floor_prim(ring, float(V[:, 2].min()) - 0.02))
+    # the floor is the ROOF's plan, not the map's: where the survey shows the building under only
+    # part of its outline (gers_0b9fca8a, an L whose east half is ground under the bridge) the slab
+    # must stop where the building does
+    import shapely
+    plan = shapely.unary_union([shapely.Polygon(V[T[i]][:, :2]) for i in roof if shapely.Polygon(V[T[i]][:, :2]).is_valid]).simplify(0.05)
+    for j, pg in enumerate(plan.geoms if plan.geom_type == "MultiPolygon" else [plan]):
+        if pg.area >= 1.0:
+            fp = geometry.floor_prim(np.asarray(pg.exterior.coords)[:-1], float(V[:, 2].min()) - 0.02)
+            fp["name"] = "floor" if j == 0 else f"floor{j}"; prims.append(fp)
     log(f"  floor: footprint slab at z = {V[:, 2].min():.2f} m")
     log(f"  skylights: {len(boxes)} monitors as boxes, "
         f"heights {sorted(round(b['z1']-b['z0'], 1) for b in boxes)}")
@@ -217,7 +228,7 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
     return b
 
 
-def fallback_solid(ring, P, z_ground):
+def fallback_solid(ring, P, z_ground, neighbours=()):
     """No roofer solid: the surveyed outline extruded to the measured top, its own roof planes on it.
 
     `objects.building_model` already is this — prism when the returns cannot say more, the
@@ -227,7 +238,7 @@ def fallback_solid(ring, P, z_ground):
     from . import objects
     ztop = float(np.percentile(P[:, 2], 98)) if len(P) else z_ground + 6.0
     parts = objects.building_model(np.asarray(ring), z_ground, ztop,
-                                   x=P[:, 0], y=P[:, 1], z=P[:, 2])
+                                   x=P[:, 0], y=P[:, 1], z=P[:, 2], neighbours=neighbours)
     if not parts:
         from .scene import footprint_prism
         soup, _ = footprint_prism(np.asarray(ring), z_ground, max(ztop, z_ground + 3.0))

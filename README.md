@@ -149,6 +149,7 @@ python -m ducklidar.tools.fetch_streetview --points b.npz --out out/photos
 python -m ducklidar.tools.segment          --photos out/photos     # SAM 3, both passes, one image load
 python -m ducklidar.tools.roofer --points box.laz --footprints b.gpkg --out out/roofer --bin ./roofer
 python -m ducklidar.tools.build_tile --tile tiles/490000_5457000.parquet --footprints footprints/granville_island.duckdb --root .
+python -m ducklidar.tools.map        --tile tiles/490000_5457000.parquet --footprints footprints/granville_island.duckdb --root .   # every footprint, its id, a Google Earth link
 ```
 
 `build_tile` is the whole tile in one go: every footprint of a duckOverture
@@ -191,6 +192,9 @@ The design behind the one call is
 - [The labeling rules](docs/rules-operators.md) — the measured rules
   (lifted verbatim into `ducklidar.rules`) and the worksheet for their
   table-shaped redesign.
+- [Three outlines for one building](docs/footprints.md) — the Overture footprint
+  the model is built on, the outline the returns draw, and the footprint proposed
+  from it; the dashboard's Plan panel draws all three.
 - [The photo manifest](docs/photo-manifest.md) — bring your own photos:
   what a folder of images must say about itself so `building3d` can use it.
 - [Where the data lives](docs/data-layout.md) — one folder per building:
