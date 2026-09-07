@@ -97,11 +97,13 @@ def outer_walls(F, ring, tol=1.5, base_z=None):
     for f in F:
         c = f["p0"] + f["u"] * (f["s0"] + f["s1"]) / 2
         on_outline = edge.distance(Point(c[0], c[1])) <= tol
-        # An interior plane that RISES between two roof levels is not a partition — it is the
-        # step that closes the envelope, and dropping it left the Net Loft's roof open over its
-        # own setbacks. Keep any inner plane whose foot stands above the building's base.
-        riser = f["t0"] + f["p0"][2] > base_z + 1.0 if base_z is not None else False
-        (keep if (on_outline or riser) else inner).append(f)
+        # A WALL REACHES THE GROUND. Everything else that stands on this solid — roof-step risers,
+        # plant-room sides, parapet returns — has its foot at roof level, and on the Net Loft that
+        # was 58 of 68 "walls", scattered up to 21 m inside the footprint at base heights of 7-12 m
+        # (Kaveh, 2026-09-06: "a lot of extra wall that is not real"). They are roof furniture, and
+        # the roof surface already covers them, so they are not drawn as walls.
+        grounded = base_z is None or f["t0"] + f["p0"][2] <= base_z + 1.0
+        (keep if (on_outline and grounded) else inner).append(f)
     return (keep, inner) if keep else (F, [])          # never leave a building with no walls
 
 

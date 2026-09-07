@@ -194,7 +194,19 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
 
     # ---- roof, skylights, floor -------------------------------------------------------------
     boxes = geometry.skylight_boxes(P, rgb, ring)
-    roof = np.flatnonzero(n[:, 2] > 0.3); vid = np.unique(T[roof])
+    # THE ROOF IS THE TOP, NOT EVERY UPWARD FACE. A roofer solid's upward triangles include canopy
+    # soffits and the undersides of its steps, which sit 1.5-4 m up; drawn as roof they hung down
+    # OVER the walls as sloping panels around the building (Kaveh, 2026-09-06). A roof triangle has
+    # to stand near the top of its own column: keep those within 3 m of the highest roof face over
+    # the same spot, which keeps a real multi-level roof and drops the low fringe.
+    up = np.flatnonzero(n[:, 2] > 0.3)
+    zc = V[T[up]].mean(1)[:, 2]
+    roof = up[zc >= np.percentile(zc, 5) - 0.5] if len(up) else up
+    if len(roof):
+        tall = zc[zc >= np.percentile(zc, 5) - 0.5]
+        keep = tall >= (V[:, 2].min() + 0.55 * (tall.max() - V[:, 2].min()))
+        if keep.sum() >= 4: roof = roof[keep]
+    vid = np.unique(T[roof])
     remap = np.full(len(V), -1); remap[vid] = np.arange(len(vid))
     bbox = (V[:, 0].min() - 1, V[:, 1].min() - 1, V[:, 0].max() + 1, V[:, 1].max() + 1)
     rtex, roof_base = wl.roof_texture(P, rgb, bbox, ring, [b["corners"] for b in boxes])
