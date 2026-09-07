@@ -101,7 +101,11 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
     V, T = (geometry.load_solid(solid, solids) if solid is not None
             else fallback_solid(ring, P, zg))
     n = geometry.normals(V, T); centre = V.mean(0)
-    F = geometry.facades(V, T, n, centre); E = geometry.outer_edges(F)
+    F, slivers = geometry.drop_slivers(geometry.facades(V, T, n, centre))
+    F, inner = geometry.outer_walls(F, ring, base_z=float(V[:, 2].min()))
+    F = geometry.close_corners(F); E = geometry.outer_edges(F)
+    if slivers or inner:
+        log(f"  {len(slivers)} sliver + {len(inner)} interior facades dropped; {len(F)} outer walls")
     SOLID = dict(V=V, T=T)
     log(f"solid: {len(V)} vertices, {len(T)} triangles → {len(F)} facades, "
         f"{int((n[:, 2] > 0.3).sum())} roof triangles, {len(E)} outer edges")
@@ -151,7 +155,10 @@ def building3d(footprint, *, store=None, points=None, photos=None, masks=None, e
         if info is None or tex is None:
             w, h = wl.tex_size(Fk)
             tex = fcompose.compose(w, h, base_mat, [])[0] if base_mat else np.tile(wall_base, (h, w, 1))
-        if k in done:
+        # every wall is recorded, composed or not — the caller wants the building's plan, not
+        # only the walls a photo happened to reach (Kaveh, 2026-09-06: a run with no photos
+        # reported 0 facades while building 170 of them).
+        if True:
             wall_list.append(dict(
                 id=f"facade{k:02d}", w=round(Fk["s1"] - Fk["s0"], 1), h=round(Fk["t1"] - Fk["t0"], 1),
                 facing=round(math.degrees(math.atan2(Fk["n"][1], Fk["n"][0]))),
