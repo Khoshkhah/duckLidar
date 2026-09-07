@@ -903,10 +903,22 @@ def building_model(ring, z0, ztop, col=None, mesh=None,
                 shapely.Polygon(ring), lo[0] + (gx + 0.5) * pix,
                 lo[1] + (gy + 0.5) * pix)
             if occ.sum() >= 4:
-                soup = cell_prism(np.maximum(fitted, z0 + 0.05), z0, occ,
-                                  lo, pix)
-                if len(soup):
-                    soup = np.asarray(soup, np.float32)
+                # THE WALLS COME FROM THE OUTLINE, THE ROOF FROM THE RETURNS.
+                # cell_prism extrudes every 1 m cell from the ground, so a building whose
+                # footprint runs diagonally (bearings 39 deg / 129 deg on railspur) came out as an
+                # axis-aligned voxel staircase: 160 wall triangles whose normals were all
+                # exactly 0 or 90 deg, grouped into 38 "facades" of which 13 were 1 m slivers.
+                # The prism gives the true wall planes; the fitted cells ride on top as the
+                # roof only, which is the same division the roofer branch above makes.
+                roof = cell_prism(np.maximum(fitted, z0 + 0.05), z0, occ, lo, pix)
+                body, bcols = footprint_prism(ring, z0, ztop, col=col)
+                if len(body):
+                    soup = np.asarray(body, np.float32)
+                    if len(roof):
+                        R = np.asarray(roof, np.float32).reshape(-1, 3, 3)
+                        nz = np.cross(R[:, 1] - R[:, 0], R[:, 2] - R[:, 0])[:, 2]
+                        up = nz / np.maximum(np.linalg.norm(np.cross(R[:, 1] - R[:, 0], R[:, 2] - R[:, 0]), axis=1), 1e-9)
+                        soup = np.vstack([soup, R[up > 0.5].reshape(-1, 3)])   # the roof faces only
                     return [(soup, _tint(soup, col, (170, 165, 158)), SOLID)]
     soup, cols = footprint_prism(ring, z0, ztop, col=col)
     return [(soup, cols, SOLID)] if len(soup) else []

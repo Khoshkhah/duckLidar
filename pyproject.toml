@@ -46,6 +46,7 @@ where = ["src"]
 # compare_channels() reads the viewer shell at runtime
 [tool.setuptools.package-data]
 ducklidar = ["_viewer.html"]
+"ducklidar.tools" = ["vendor/*.js"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

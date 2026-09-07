@@ -5,9 +5,9 @@
 
 Walks the layout of `docs/data-layout.md`: every `out/<id>/` that holds a `building.glb` is a
 building, its photos come from `buildings/<id>/photos/manifest.json`, and its returns from
-`buildings/<id>/points.npz` when one was cached (else the points panel says so). One HTML file,
-self-contained except three.js from a CDN — models, thumbnails and points are embedded, so it
-opens from disk and can be mailed.
+`buildings/<id>/points.npz` when one was cached (else the points panel says so). One HTML file, fully
+self-contained — three.js, the models, the thumbnails and the points are all embedded, so it
+opens from disk with no network and can be mailed.
 
 Left: the LiDAR returns in the survey's own colour. Right: the model, orbit and wireframe.
 Below: the photos with the camera that took each one marked in the model view. A building
@@ -80,8 +80,18 @@ def collect(root, only=(), max_points=MAX_POINTS, log=print):
     return out
 
 
+VENDOR = Path(__file__).parent / "vendor"          # three.js r128 + GLTFLoader + OrbitControls, MIT
+
+
+def three_js():
+    """The three.js bundle, inlined — the page must open with no network at all (a browser on
+    another machine, an air-gapped review, an emailed file)."""
+    return "\n".join((VENDOR / n).read_text() for n in ("three.min.js", "GLTFLoader.js", "OrbitControls.js"))
+
+
 def page(buildings):
-    return TEMPLATE.replace("%DATA%", json.dumps(buildings)).replace("%N%", str(len(buildings)))
+    return (TEMPLATE.replace("%THREE%", three_js())
+            .replace("%DATA%", json.dumps(buildings)).replace("%N%", str(len(buildings))))
 
 
 TEMPLATE = r"""<!doctype html><html><head><meta charset="utf-8"><title>ducklidar — buildings</title>
@@ -121,9 +131,7 @@ label{font-size:12px;color:var(--muted);margin-left:12px}
 <div class="strip"><h2>Photos <span style="color:var(--muted);font-weight:400">— click one to see it large and mark its camera in the model; faded ones were not used</span></h2>
  <div class="gallery" id="gallery"></div></div>
 <div id="big" onclick="this.style.display='none'"><img id="bigimg"></div>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/build/three.min.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/loaders/GLTFLoader.js"></script>
-<script src="https://cdn.jsdelivr.net/npm/three@0.128.0/examples/js/controls/OrbitControls.js"></script>
+<script>%THREE%</script>
 <script>
 const B = %DATA%;
 const bin = s => Uint8Array.from(atob(s), c => c.charCodeAt(0));
