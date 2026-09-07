@@ -66,7 +66,7 @@ Heavier features are opt-in extras (see `pyproject.toml`):
 | Neighbourhood | `knn`, `shape_features`, `local_edges`, `scene.mesh_bridges` | one kNN query; features and the mesh graph both derive from it |
 | Trajectory | `pulses`, `sensor_track`, `tracks` | where the aircraft was, from returns alone |
 | Scene | `scene.wall_report`, `scene.checked_walls`, `scene.trace_footprint`, `scene.footprint_prism`, `scene.crown_thin`, … | reconstruction that only builds what was measured |
-| Buildings | `building3d` (**proposed**, see [design](docs/design/building3d.md)) | an OSM way id → a textured 3-D building: footprint, its returns, solid, facades from street photos |
+| Facades | `facade.texture_wall`, `facade.elements.parse_wall`, `facade.compose.compose`, `facade.relief.relief_prims` | a wall from street photos: its outline found IN the image, windows/doors/awnings measured, then drawn and built as joinery |
 | Objects | `objects.*_model` (one per type), `bridge_ribbon`, `bridge_lights`, `fit_roof_planes` | an instance → triangles, and the KIND the sun reads: solid / slab / glass / surface |
 | Type tests | `looks_like_car`, `looks_like_boat`, `looks_like_tree`, `looks_like_deck`, `looks_like_pole` | is it one? a physical question per type, thresholds from measured populations |
 | Instance cuts | `raft_split`, `car_split`, `crown_split`, `footprint_ids` | what connectivity welds, cut by the evidence that actually separates it |
@@ -74,28 +74,40 @@ Heavier features are opt-in extras (see `pyproject.toml`):
 | Map facts | `pier_ways` | OSM/Overture ways from a local [duckOverture](../duckOverture) extract |
 | Looking | `plot.plan`, `plot.section`, `plot.compare`, `compare_channels`, `notebook_view` | plots and a self-contained HTML viewer |
 
-## One building, in one call (proposed)
+## Facades from street photos
 
-The pieces above compose into a building: give an OSM way id, get a
-textured model back — footprint from the map, returns from the store,
-a roof solid, and facades reconstructed from street photos with windows,
-doors and awnings as measured 3-D joinery.
+`ducklidar.facade` textures a building's walls from ordinary street-level
+photos. The camera pose is never trusted for pixel placement — it only says
+roughly where to look. Each wall's outline is found **in the image** (the
+eave against the sky, the corners on vertical lines), rectified to a metric
+strip, stitched with the other photos of that wall, and the holes left by
+cars and trees are filled with the building's own wall colour. The windows,
+doors and awnings detected in every photo become one list in metres on the
+wall, and that list is both painted and **built**: frame bars, projecting
+sills, mullions, glass set back, door jambs, awning fascias.
 
 ```python
-b = dl.building3d(714927893, store="data/lidar/*.parquet", out="out/")
-b.glb            # the textured model
-b.walls          # per wall: size, facing, photos used, coverage
-b.elements       # per wall: windows / doors / awnings, in metres
+from ducklidar import facade
+facade.CTX.use(ROOT=repo, Z_GROUND=3.65, SOLID=dict(V=V, T=T), occlusion_map=occ)
+
+tex, valid, info = facade.texture_wall(F, cands, w, h, photos, masks_dir)   # photo-stitched
+els  = facade.elements.parse_wall(F, info["strips"], elements_dir, photos)  # metres, deduped, rows
+mat  = facade.compose.material(tex, valid, els)
+wall = facade.compose.compose(w, h, mat, els)                               # the composed wall
+prims = facade.relief.relief_prims(F, els, origin, wall)                    # glTF joinery
 ```
 
-Not built yet: the method is proven on three buildings in
-[shadowCity2](../shadowCity2)'s pilot (`tools/pilot/`), and the design for
-moving it here — the API, the four private stages, the photo-source and
-segmenter interfaces, and the five decisions it needs — is
-[docs/design/building3d.md](docs/design/building3d.md). What it can and
-cannot do is stated there: geometry is exact from the LiDAR, element
-positions are measured to about 2 % of the wall, and a wall no photo sees
-properly gets the building's material and nothing invented.
+Measured on Granville Island ([shadowCity2](../shadowCity2)'s pilot, three
+buildings): element positions land within about 2 % of the wall where a
+photo sees it frontally, and the joinery sizes came from the crops
+themselves — frame 0.145 m, mullion 0.155 m, sill 0.065 m proud 0.075 m,
+glass 0.035 m behind. A wall no photo sees properly gets the building's
+material and **nothing invented** — which, on a real block, is most walls.
+
+Extras: `facade` (scikit-image, shapely). The masks come from any segmenter
+that labels occluders, buildings and facade elements; the pilot uses SAM 3.
+Composing the whole thing into one call — an OSM way id in, a model out —
+is [docs/design/building3d.md](docs/design/building3d.md).
 
 ## Documentation
 

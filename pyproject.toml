@@ -29,6 +29,8 @@ viz = ["matplotlib>=3.7", "pillow>=10"]
 scene = ["scipy>=1.10", "shapely>=2.0", "mapbox_earcut>=1.0", "scikit-image>=0.22"]
 # pier_ways() — map facts from a local duckOverture extract, no Overpass round-trips
 overture = ["duckdb>=1.0", "pyproj>=3.5"]
+# facade textures from street photos (ducklidar.facade)
+facade = ["scikit-image>=0.22", "shapely>=2.0"]
 dev = ["pytest>=7", "duckdb>=1.0", "pyproj>=3.5", "scipy>=1.10", "cloth-simulation-filter>=1.1", "matplotlib>=3.7", "pillow>=10", "scikit-image>=0.22", "shapely>=2.0", "mapbox_earcut>=1.0", "ipykernel>=6"]
 
 [tool.setuptools.packages.find]
