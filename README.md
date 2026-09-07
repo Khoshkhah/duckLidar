@@ -184,6 +184,8 @@ The design behind the one call is
   what a folder of images must say about itself so `building3d` can use it.
 - [Where the data lives](docs/data-layout.md) — one folder per building:
   the conventional layout and naming for tiles, footprints, photos and outputs.
+  `python -m ducklidar.tools.dashboard --root .` then puts every built building on
+  one page: pick one, orbit its points and its model, click its photos.
 - [API reference](docs/api.md) — every public function, grouped, with
   signatures.
 
